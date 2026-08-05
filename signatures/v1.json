@@ -1,3 +1,12 @@
 {
-   "signedContributors": []
+  "signedContributors": [
+    {
+      "name": "asim-06",
+      "id": 229275758,
+      "comment_id": 5188858086,
+      "created_at": "2026-08-05T07:27:46Z",
+      "repoId": 1323654519,
+      "pullRequestNo": 7
+    }
+  ]
 }

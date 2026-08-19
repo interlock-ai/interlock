@@ -37,7 +37,7 @@ every task here and is not repeated per task.
   **Constraints:** hard rule 1. This function is the only place git is invoked,
   so it is the only place the read-only promise can be broken.
 
-- [ ] **Repo discovery**
+- [x] **Repo discovery**
       **Files:** `packages/core/src/git/discovery.ts`
       **What:** `openUserRepo`, `describeRepo`, `listBranchRefs`, `mergeBase`.
 
@@ -118,9 +118,15 @@ every task here and is not repeated per task.
   has it. The file is 0700 under the data dir. Store spans and truncated
   excerpts, never full file contents, never secrets.
 
-  **Done when:** the daemon restarts and reproduces its previous state; a test
-  runs migrations twice and asserts idempotency; a test asserts the file mode;
-  and `readEvents(since)` replays in ULID order across a restart.
+  Upsert on the natural key, not on the id: discovery mints a fresh ULID per
+  observation, so `repos` reconciles on `rootPath` and `branch_refs` on
+  `(repoId, ref)`. Keying on the id instead would insert a duplicate row every
+  time the watcher re-lists a branch.
+
+  **Done when:** the daemon restarts and reproduces its previous state; listing
+  the same branch twice leaves one row, not two; a test runs migrations twice and
+  asserts idempotency; a test asserts the file mode; and `readEvents(since)`
+  replays in ULID order across a restart.
 
 - [ ] **Watcher**
       **Files:** `packages/daemon/src/watcher/`
@@ -134,6 +140,11 @@ every task here and is not repeated per task.
   a directory being deleted while watched, and a file count that exceeds the
   OS watch limit, which must degrade to polling with a warning rather than
   crashing.
+
+  Resolve watched paths with `realpath` before comparing them to anything from
+  discovery: git reports canonical paths, so on macOS a worktree registered as
+  `/var/...` arrives from git as `/private/var/...` and naive comparison never
+  matches.
 
   Publish two events at different levels. `worktree.changed` is the raw
   filesystem signal, kept for replay and debugging. `branch.snapshot`, carrying

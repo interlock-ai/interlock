@@ -10,6 +10,7 @@ export type InterlockErrorCode =
   | 'CONFIG_INVALID'
   | 'REPO_NOT_FOUND'
   | 'REPO_NOT_GIT'
+  | 'REPO_BARE'
   | 'GIT_COMMAND_FAILED'
   | 'SHADOW_UNAVAILABLE'
   | 'MERGE_FAILED'

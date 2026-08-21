@@ -105,7 +105,13 @@ every task here and is not repeated per task.
       without touching the user's index.
 
   Pass `indexFile` to the git runner so staging targets a temp index outside the
-  repo, populate it, then `write-tree`. Objects land in the user's object database, which is additive and
+  repo, populate it, then `write-tree`. The runner validates that path through
+  `realpath` and refuses one that lands inside the worktree, its git dir, or the
+  git dir a linked worktree shares with the main checkout — so `mkdtemp` a
+  directory first and join the filename onto it; a path whose parent does not
+  exist is refused as unverifiable. `read-tree -u` and `--index-output` are
+  refused outright: the first writes the working tree, which no index
+  redirection protects, and the second overrides the redirection. Objects land in the user's object database, which is additive and
   safe; the index never is. Untracked files are included, ignored files are not.
   A clean worktree returns the HEAD tree and does no work. The temp index is
   removed on the error path as well as the success path.
@@ -143,7 +149,11 @@ every task here and is not repeated per task.
       merge-base.
 
   Parse `diff --numstat -z` and `diff --name-status -z` with NUL separation, not
-  newlines, so paths containing spaces or newlines survive. Handle renames
+  newlines, so paths containing spaces or newlines survive. Both forms are
+  computed internally, so neither runs a repository's `diff.external` or
+  `textconv` driver. Any diff that produces a **patch** does, and repository
+  config is the layer the runner's environment scrubbing cannot reach — a
+  patch-producing diff needs `--no-ext-diff` and `--no-textconv`. Handle renames
   (`-M`), copies, mode changes, binary files (no hunks, flagged) and deletions.
   Symbol extraction stays empty until M4 — leave the field, do not guess.
 
@@ -168,9 +178,15 @@ every task here and is not repeated per task.
   `(repoId, ref)`. Keying on the id instead would insert a duplicate row every
   time the watcher re-lists a branch.
 
+  `BranchRef.dirty` is nullable, and `null` — the worktree could not be read —
+  must survive the round trip as itself rather than as a clean state. A schema
+  that folds the two together loses the distinction permanently, since nothing
+  re-reads a branch that reported no changes.
+
   **Done when:** the daemon restarts and reproduces its previous state; listing
-  the same branch twice leaves one row, not two; a test runs migrations twice and
-  asserts idempotency; a test asserts the file mode; and `readEvents(since)`
+  the same branch twice leaves one row, not two; a branch stored with an unknown
+  dirty state reads back unknown rather than clean; a test runs migrations twice
+  and asserts idempotency; a test asserts the file mode; and `readEvents(since)`
   replays in ULID order across a restart.
 
 - [ ] **Watcher**
@@ -197,7 +213,10 @@ every task here and is not repeated per task.
   keys off content identity rather than filesystem noise.
 
   Cache the last tree OID per worktree and drop the event when a debounce
-  produces the same OID. Editors and agents both write files that end up
+  produces the same OID. A worktree whose dirty state came back `null` has no
+  OID to compare, so it is never deduplicated against — `contentIdentity`
+  returns `null` there for the same reason, and a cache keyed on the head alone
+  would reuse a result computed from a tree nobody read. Editors and agents both write files that end up
   byte-identical, and the saving is not the snapshot itself but everything after
   it: ChangeSet extraction, scheduling, and every pair that would be marked stale.
 
@@ -239,9 +258,13 @@ every task here and is not repeated per task.
   Exit codes: 0 for clean, non-zero for an error, and decide now whether open
   findings are a non-zero exit, because scripts will depend on it.
 
-  **Done when:** it renders correctly against three worktrees, prints an
-  actionable error with the daemon stopped, and its exit codes are covered by
-  tests.
+  A branch whose dirty state is `null` is unknown, not clean, and must read that
+  way — an unreachable worktree is the one case where the display saying
+  "nothing to see" is actively misleading.
+
+  **Done when:** it renders correctly against three worktrees, shows an
+  unreadable worktree as unknown rather than clean, prints an actionable error
+  with the daemon stopped, and its exit codes are covered by tests.
 
 - [ ] **Agent session hooks**
       **Files:** `packages/daemon/src/hooks/`
@@ -286,7 +309,14 @@ every task here and is not repeated per task.
   means loose refs, `packed-refs`, **reflogs**, `ORIG_HEAD`, `FETCH_HEAD` and
   `MERGE_HEAD` — a stray reflog entry is still a write to the user's repository.
   Run it against a repo in every awkward state the other tasks named: dirty,
-  detached HEAD, mid-rebase, with a stash, with submodules.
+  detached HEAD, mid-rebase, with a stash, with submodules. Include a linked
+  worktree and hash the git dir it shares with the main checkout, not only its
+  own — that shared directory holds the index a redirection must miss, and a
+  linked worktree's handle names neither it nor the main checkout.
+
+  The cycle must include a snapshot, so the index-only path — the one place a
+  command that writes an index is allowed to run against a user repository — is
+  covered rather than skipped.
 
   If the `.git/index` mtime assertion proves flaky, the honest fix is to assert
   index _contents_ rather than mtime — some git versions rewrite the index to

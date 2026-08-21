@@ -71,9 +71,15 @@ every task here and is not repeated per task.
   the pair from analysis.
 
   Ignore patterns come from the repository's own `.interlock.json`, which the
-  agents Interlock watches can write, so glob translation is attacker-facing:
-  runs of `*` must collapse to one wildcard or the regex backtracks
-  exponentially.
+  agents Interlock watches can write, and so do the branch names they are
+  matched against. Match them by scanning, not by translating to a regex: a
+  pattern alternating wildcards with literals backtracks exponentially, and the
+  match runs on the event loop for every branch.
+
+  A worktree that is listed is not necessarily readable — `worktree lock` keeps
+  a worktree on a removable volume from being pruned, so a missing directory is
+  listed as locked rather than prunable. `dirty` is `null` there. One
+  unreachable worktree must not fail the listing, and must not read as clean.
 
   **Done when:** an integration test builds a repo with two linked worktrees, a
   detached HEAD and an unborn branch, and every function returns correct results

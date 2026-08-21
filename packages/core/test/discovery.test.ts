@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ulid } from '@interlock/shared';
@@ -65,6 +65,15 @@ describe('repo discovery', () => {
       expect(viaWorktree.gitDir).not.toContain('worktrees');
     });
 
+    it('resolves a nested subdirectory to the repository root', async () => {
+      const nested = join(root, 'some', 'deep', 'path');
+      mkdirSync(nested, { recursive: true });
+
+      const opened = await openUserRepo(nested, options);
+
+      expect(opened.rootPath).toBe(root);
+    });
+
     it('rejects a path that does not exist', async () => {
       const error = await rejection(openUserRepo(join(base, 'no-such-dir'), options));
       expect(error.code).toBe('REPO_NOT_FOUND');
@@ -94,6 +103,31 @@ describe('repo discovery', () => {
       expect(described.defaultBranch).toBe('main');
       expect(described.rootPath).toBe(root);
       expect(described.shadowPath).toBe(`/data/shadows/${described.id}`);
+    });
+
+    it('names the branch HEAD points at, even when it is unborn', async () => {
+      // An unborn HEAD still resolves symbolically, so `main` is not a fallback
+      // here — a repository initialised on another name reports that name.
+      const trunk = join(base, 'trunk-repo');
+      execFileSync('git', ['init', '-q', '-b', 'trunk', trunk], { stdio: 'pipe' });
+
+      const described = await describeRepo(
+        { kind: 'user', rootPath: trunk, gitDir: join(trunk, '.git') },
+        options,
+      );
+      expect(described.defaultBranch).toBe('trunk');
+    });
+
+    it('falls back to main when HEAD names no branch and there is no remote', async () => {
+      const described = await describeRepo(
+        {
+          kind: 'user',
+          rootPath: join(base, 'wt-detached'),
+          gitDir: join(root, '.git'),
+        },
+        options,
+      );
+      expect(described.defaultBranch).toBe('main');
     });
 
     it('prefers what the remote declares', async () => {
@@ -134,6 +168,36 @@ describe('repo discovery', () => {
       expect(gone?.worktreePath).toBeNull();
     });
 
+    it('reads a staged rename as one destination path', async () => {
+      // `-z` emits `R dest\0src\0`, so the source field has to be consumed.
+      // Read as a status entry it yields the garbage path `txt` in both lists.
+      const worktree = join(base, 'wt-feature');
+      git(worktree, 'mv', 'a.txt', 'b.txt');
+
+      const refs = await listBranchRefs(repo, repoId, options);
+      const feature = refs.find((ref) => ref.name === 'feature');
+
+      expect(feature?.dirty?.stagedFiles).toEqual(['b.txt']);
+      expect(feature?.dirty?.unstagedFiles).toEqual([]);
+      expect(feature?.dirty?.untrackedFiles).toEqual([]);
+    });
+
+    it('reports an unreadable worktree as unknown rather than clean', async () => {
+      // `worktree lock` is what keeps a worktree on a removable volume from
+      // being pruned, so a missing directory is listed as locked, not prunable.
+      git(root, 'branch', 'locked');
+      git(root, 'worktree', 'add', '-q', join(base, 'wt-locked'), 'locked');
+      git(root, 'worktree', 'lock', join(base, 'wt-locked'));
+      rmSync(join(base, 'wt-locked'), { recursive: true, force: true });
+
+      const refs = await listBranchRefs(repo, repoId, options);
+      const locked = refs.find((ref) => ref.name === 'locked');
+
+      expect(locked?.dirty).toBeNull();
+      // One unreachable worktree must not take the rest of the repository down.
+      expect(refs.find((ref) => ref.name === 'feature')?.dirty?.isDirty).toBe(false);
+    });
+
     it('counts a conflicted path once', async () => {
       // Both status columns are non-blank for an unmerged path, so reading them
       // independently reports the same file as staged and unstaged at once.
@@ -151,9 +215,9 @@ describe('repo discovery', () => {
       const refs = await listBranchRefs(repo, repoId, options);
       const feature = refs.find((ref) => ref.name === 'feature');
 
-      expect(feature?.dirty.isDirty).toBe(true);
-      expect(feature?.dirty.unstagedFiles).toEqual(['a.txt']);
-      expect(feature?.dirty.stagedFiles).not.toContain('a.txt');
+      expect(feature?.dirty?.isDirty).toBe(true);
+      expect(feature?.dirty?.unstagedFiles).toEqual(['a.txt']);
+      expect(feature?.dirty?.stagedFiles).not.toContain('a.txt');
     });
 
     it('reports dirty state per worktree', async () => {
@@ -165,17 +229,17 @@ describe('repo discovery', () => {
       const refs = await listBranchRefs(repo, repoId, options);
       const feature = refs.find((ref) => ref.name === 'feature');
 
-      expect(feature?.dirty.isDirty).toBe(true);
-      expect(feature?.dirty.stagedFiles).toContain('staged.txt');
-      expect(feature?.dirty.unstagedFiles).toContain('a.txt');
-      expect(feature?.dirty.untrackedFiles).toContain('untracked.txt');
+      expect(feature?.dirty?.isDirty).toBe(true);
+      expect(feature?.dirty?.stagedFiles).toContain('staged.txt');
+      expect(feature?.dirty?.unstagedFiles).toContain('a.txt');
+      expect(feature?.dirty?.untrackedFiles).toContain('untracked.txt');
       // Content identity belongs to the snapshot step, not to discovery.
-      expect(feature?.dirty.snapshotId).toBeNull();
+      expect(feature?.dirty?.snapshotId).toBeNull();
     });
 
     it('reports a clean branch as clean', async () => {
       const refs = await listBranchRefs(repo, repoId, options);
-      expect(refs.find((ref) => ref.name === 'main')?.dirty.isDirty).toBe(false);
+      expect(refs.find((ref) => ref.name === 'main')?.dirty?.isDirty).toBe(false);
     });
 
     it('honours ignoreBranches globs', async () => {
@@ -198,7 +262,7 @@ describe('repo discovery', () => {
       expect(refs).toEqual([]);
     });
 
-    it('handles a branch name containing a space in its path', async () => {
+    it('handles a worktree whose path contains a space', async () => {
       const spaced = join(base, 'wt with space');
       git(root, 'worktree', 'add', '-q', '-b', 'spaced', spaced);
       const refs = await listBranchRefs(repo, repoId, options);
@@ -247,16 +311,28 @@ describe('repo discovery', () => {
       expect(refs.map((ref) => ref.name)).not.toContain('release/1.0');
     });
 
-    it('does not stall on a pattern built to backtrack', async () => {
-      // Ignore patterns come from the repository's own config, so a pattern is
-      // attacker-supplied. Adjacent wildcards backtrack exponentially, and this
-      // one takes tens of seconds against a translation that keeps them apart.
+    it.each([
+      ['adjacent wildcards', `${'*'.repeat(24)}x`],
+      ['wildcards alternating with literals', `${'a*'.repeat(99)}b`],
+    ])('does not stall on %s', async (_name, pattern) => {
+      // Ignore patterns come from the repository's own config, so they are
+      // attacker-supplied, and the match runs on the event loop for every
+      // branch. Translated to a regex, the second pattern explores a partition
+      // of the name per wildcard: 20 seconds at a third of this length.
+      git(root, 'branch', 'a'.repeat(150));
+
       const startedAt = Date.now();
-      await listBranchRefs(repo, repoId, {
-        ...options,
-        ignoreBranches: [`${'*'.repeat(24)}x`],
-      });
+      await listBranchRefs(repo, repoId, { ...options, ignoreBranches: [pattern] });
+
       expect(Date.now() - startedAt).toBeLessThan(2_000);
+    });
+
+    it('ignores a pattern longer than the cap rather than matching it', async () => {
+      const refs = await listBranchRefs(repo, repoId, {
+        ...options,
+        ignoreBranches: ['*'.repeat(201)],
+      });
+      expect(refs.map((ref) => ref.name)).toContain('main');
     });
   });
 

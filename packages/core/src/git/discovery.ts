@@ -1,7 +1,8 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { InterlockError, ulid } from '@interlock/shared';
+import { InterlockError, isInterlockError, ulid } from '@interlock/shared';
 import type { BranchRef, DirtyState, Repo, RepoId, BranchRefId } from '@interlock/shared';
+import { subcommandOf } from './repo-handle.js';
 import type { AnyRepo, GitResult, GitRunner, UserRepo } from './repo-handle.js';
 
 /**
@@ -28,11 +29,6 @@ export interface DescribeOptions extends DiscoveryOptions {
   readonly dataDir: string;
 }
 
-/** The subcommand in a git argv, skipping any leading flags. */
-function verbOf(args: readonly string[]): string {
-  return args.find((arg) => !arg.startsWith('-')) ?? '';
-}
-
 /**
  * Run a command whose non-zero exit means the repository is unusable.
  *
@@ -48,8 +44,8 @@ async function required(
 ): Promise<GitResult> {
   const result = await runner.run(repo, args);
   if (result.exitCode !== 0) {
-    throw new InterlockError('GIT_COMMAND_FAILED', `git ${verbOf(args)} failed`, {
-      details: { rootPath: repo.rootPath, command: verbOf(args), exitCode: result.exitCode },
+    throw new InterlockError('GIT_COMMAND_FAILED', `git ${subcommandOf(args) ?? ''} failed`, {
+      details: { rootPath: repo.rootPath, command: subcommandOf(args), exitCode: result.exitCode },
       remedy: 'Check that the repository is readable and no other git process holds it.',
       infra: true,
     });
@@ -132,9 +128,14 @@ export async function openUserRepo(path: string, options: DiscoveryOptions): Pro
 /**
  * The branch in-flight work is expected to land on.
  *
- * Prefers what the remote declares, because that is what the team actually
- * merges into; falls back to the checked-out branch, then to `main` for a
- * repository with an unborn HEAD and no remote.
+ * Prefers what `origin` declares, because that is what the team actually merges
+ * into, and falls back to the branch HEAD names — which an unborn HEAD still
+ * does, so a repository initialised on `trunk` answers `trunk`. The literal
+ * `main` is reached only by a detached HEAD with no `origin`, where there is no
+ * branch to name.
+ *
+ * Only `origin` is consulted. A repository whose upstream has another name
+ * falls through to HEAD rather than guessing among remotes.
  */
 async function resolveDefaultBranch(repo: UserRepo, runner: GitRunner): Promise<string> {
   const remote = await runner.run(repo, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
@@ -179,7 +180,6 @@ function shadowPathFor(id: RepoId, dataDir: string): string {
 
 interface WorktreeEntry {
   readonly path: string;
-  readonly head: string | null;
   readonly ref: string | null;
   readonly prunable: boolean;
 }
@@ -193,14 +193,12 @@ interface WorktreeEntry {
 function parseWorktreeList(stdout: string): WorktreeEntry[] {
   const entries: WorktreeEntry[] = [];
   let path: string | null = null;
-  let head: string | null = null;
   let ref: string | null = null;
   let prunable = false;
 
   const flush = (): void => {
-    if (path !== null) entries.push({ path, head, ref, prunable });
+    if (path !== null) entries.push({ path, ref, prunable });
     path = null;
-    head = null;
     ref = null;
     prunable = false;
   };
@@ -217,8 +215,7 @@ function parseWorktreeList(stdout: string): WorktreeEntry[] {
     if (key === 'worktree') {
       flush();
       path = value;
-    } else if (key === 'HEAD') head = value;
-    else if (key === 'branch') ref = value;
+    } else if (key === 'branch') ref = value;
     else if (key === 'prunable') prunable = true;
   }
   flush();
@@ -306,28 +303,50 @@ const MAX_PATTERN_LENGTH = 200;
  * Deliberately not a full glob implementation: `core` takes no dependencies,
  * and branch ignore rules in practice are `release/*` and `wip-*`.
  *
- * Patterns arrive from a repository's own config, which is written by the
- * agents Interlock watches, so the translation has to be safe on hostile input.
- * Runs of `*` collapse to one `.*` because adjacent `.*` groups backtrack
- * exponentially: sixteen stars against a sixteen-character branch name takes
- * 25 seconds, and the pattern's author chooses the number of stars.
+ * Matched by scanning rather than by translating to a regex. Patterns come from
+ * a repository's own config, written by the agents Interlock watches, and the
+ * names come from the same repository — so both sides are hostile. A regex
+ * translation backtracks exponentially on a pattern that alternates literals
+ * with wildcards: `a*a*a…b` against a name of `a`s takes 20 seconds at 33
+ * characters, on the event loop, for every branch the pattern is tried against.
+ * This scan backtracks to the last `*` only, which bounds it at the product of
+ * the two lengths.
+ *
+ * Both sides are compared by code point, so `?` consumes an astral character
+ * whole rather than half a surrogate pair.
  */
 function matchesGlob(name: string, pattern: string): boolean {
   if (pattern.length > MAX_PATTERN_LENGTH) return false;
 
-  let source = '';
-  for (let i = 0; i < pattern.length; i++) {
-    const char = pattern[i]!;
-    if (char === '*') {
-      while (pattern[i + 1] === '*') i++;
-      source += '.*';
-    } else if (char === '?') {
-      source += '.';
+  const subject = [...name];
+  const glob = [...pattern];
+  let subjectIndex = 0;
+  let globIndex = 0;
+  // Where to resume if the run this `*` is currently claiming turns out to be
+  // one character too short.
+  let starIndex = -1;
+  let resumeIndex = 0;
+
+  while (subjectIndex < subject.length) {
+    const globChar = glob[globIndex];
+    if (globChar === '?' || (globChar !== undefined && globChar === subject[subjectIndex])) {
+      globIndex++;
+      subjectIndex++;
+    } else if (globChar === '*') {
+      starIndex = globIndex;
+      globIndex++;
+      resumeIndex = subjectIndex;
+    } else if (starIndex !== -1) {
+      globIndex = starIndex + 1;
+      resumeIndex++;
+      subjectIndex = resumeIndex;
     } else {
-      source += char.replace(/[.+^${}()|[\]\\*?]/gu, '\\$&');
+      return false;
     }
   }
-  return new RegExp(`^${source}$`, 'u').test(name);
+
+  while (glob[globIndex] === '*') globIndex++;
+  return globIndex === glob.length;
 }
 
 /**
@@ -377,7 +396,7 @@ export async function listBranchRefs(
 
     const worktree = byRef.get(ref) ?? null;
     const dirty =
-      worktree === null ? cleanState(now) : await readDirtyState(worktree.path, options.runner);
+      worktree === null ? cleanState(now) : await tryDirtyState(worktree.path, options.runner);
 
     result.push({
       id: ulid<BranchRefId>(),
@@ -394,6 +413,26 @@ export async function listBranchRefs(
   }
 
   return result;
+}
+
+/**
+ * Dirty state for one worktree, or `null` where it could not be read.
+ *
+ * A worktree can be listed and still be unreachable: `git worktree lock` marks
+ * one to survive pruning, which is what a worktree on a removable volume is
+ * locked for, so a missing directory carries `locked` rather than `prunable`
+ * and passes the filter above. Failing the whole repository's listing over one
+ * such worktree would take down discovery for every other branch in it, and
+ * reporting it clean would be worse — nothing looks again at a branch that
+ * reported no changes.
+ */
+async function tryDirtyState(worktreePath: string, runner: GitRunner): Promise<DirtyState | null> {
+  try {
+    return await readDirtyState(worktreePath, runner);
+  } catch (error) {
+    if (isInterlockError(error) && error.code === 'GIT_COMMAND_FAILED') return null;
+    throw error;
+  }
 }
 
 /** A branch with no worktree cannot have uncommitted work. */

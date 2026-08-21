@@ -2,24 +2,14 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { isInterlockError, ulid } from '@interlock/shared';
-import type { InterlockError, RepoId } from '@interlock/shared';
+import { ulid } from '@interlock/shared';
+import type { RepoId } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { describeRepo, listBranchRefs, mergeBase, openUserRepo } from '../src/git/discovery.js';
 import { createGitRunner } from '../src/git/repo-handle.js';
-import type { DiscoveryOptions } from '../src/git/discovery.js';
+import type { DescribeOptions } from '../src/git/discovery.js';
 import type { UserRepo } from '../src/git/repo-handle.js';
-
-async function rejection(promise: Promise<unknown>): Promise<InterlockError> {
-  const error: unknown = await promise.then(
-    () => undefined,
-    (reason: unknown) => reason,
-  );
-  if (!isInterlockError(error)) {
-    throw new Error(`expected an InterlockError, got: ${String(error)}`);
-  }
-  return error;
-}
+import { rejection } from './support/rejection.js';
 
 /**
  * Discovery against a repository in the states that actually occur: several
@@ -31,7 +21,7 @@ describe('repo discovery', () => {
   let root: string;
   let repo: UserRepo;
   const repoId = ulid<RepoId>();
-  const options: DiscoveryOptions = { runner: createGitRunner(), dataDir: '/data' };
+  const options: DescribeOptions = { runner: createGitRunner(), dataDir: '/data' };
 
   const git = (dir: string, ...args: string[]): string =>
     execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe', encoding: 'utf8' });
@@ -63,11 +53,21 @@ describe('repo discovery', () => {
   });
 
   describe('openUserRepo', () => {
-    it('resolves a nested path to the repository root', async () => {
-      const opened = await openUserRepo(join(base, 'wt-feature'), options);
-      expect(opened.kind).toBe('user');
-      expect(opened.rootPath).toBe(join(base, 'wt-feature'));
-      expect(opened.gitDir).toContain('worktrees');
+    it('resolves a linked worktree to the repository that owns it', async () => {
+      // Two worktrees of one repository are one repository. Naming them apart
+      // would give the store two rows and the pair two shadow clones.
+      const viaWorktree = await openUserRepo(join(base, 'wt-feature'), options);
+      const viaRoot = await openUserRepo(root, options);
+
+      expect(viaWorktree.kind).toBe('user');
+      expect(viaWorktree.rootPath).toBe(viaRoot.rootPath);
+      expect(viaWorktree.gitDir).toBe(viaRoot.gitDir);
+      expect(viaWorktree.gitDir).not.toContain('worktrees');
+    });
+
+    it('rejects a path that does not exist', async () => {
+      const error = await rejection(openUserRepo(join(base, 'no-such-dir'), options));
+      expect(error.code).toBe('REPO_NOT_FOUND');
     });
 
     it('rejects a path that is not a repository', async () => {
@@ -134,6 +134,28 @@ describe('repo discovery', () => {
       expect(gone?.worktreePath).toBeNull();
     });
 
+    it('counts a conflicted path once', async () => {
+      // Both status columns are non-blank for an unmerged path, so reading them
+      // independently reports the same file as staged and unstaged at once.
+      const worktree = join(base, 'wt-feature');
+      writeFileSync(join(worktree, 'a.txt'), 'from feature\n');
+      git(worktree, 'commit', '-qam', 'feature edit');
+      writeFileSync(join(root, 'a.txt'), 'from main\n');
+      git(root, 'commit', '-qam', 'main edit');
+      try {
+        git(worktree, 'merge', 'main');
+      } catch {
+        // A conflicting merge exits non-zero; the conflict is the fixture.
+      }
+
+      const refs = await listBranchRefs(repo, repoId, options);
+      const feature = refs.find((ref) => ref.name === 'feature');
+
+      expect(feature?.dirty.isDirty).toBe(true);
+      expect(feature?.dirty.unstagedFiles).toEqual(['a.txt']);
+      expect(feature?.dirty.stagedFiles).not.toContain('a.txt');
+    });
+
     it('reports dirty state per worktree', async () => {
       writeFileSync(join(base, 'wt-feature', 'staged.txt'), 'staged\n');
       git(join(base, 'wt-feature'), 'add', 'staged.txt');
@@ -184,6 +206,60 @@ describe('repo discovery', () => {
     });
   });
 
+  describe('a command that fails', () => {
+    it('reports the failure without carrying git stderr into the error', async () => {
+      // stderr names branches and paths. `details` is documented as holding
+      // neither secrets nor file contents, and the error reaches agents.
+      const plain = mkdtempSync(join(tmpdir(), 'interlock-plain-'));
+      try {
+        const handle: UserRepo = { kind: 'user', rootPath: plain, gitDir: join(plain, '.git') };
+        const error = await rejection(listBranchRefs(handle, repoId, options));
+
+        expect(error.code).toBe('GIT_COMMAND_FAILED');
+        expect(error.infra).toBe(true);
+        expect(error.message).toContain('for-each-ref');
+        expect(error.details.command).toBe('for-each-ref');
+        expect(error.remedy).not.toContain('fatal:');
+        expect(JSON.stringify(error.details)).not.toContain('fatal:');
+      } finally {
+        rmSync(plain, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('ignoring branches', () => {
+    it('matches ? against exactly one character', async () => {
+      git(root, 'branch', 'wip');
+      git(root, 'branch', 'wipe');
+
+      const refs = await listBranchRefs(repo, repoId, { ...options, ignoreBranches: ['wip?'] });
+      const names = refs.map((ref) => ref.name);
+
+      expect(names).toContain('wip');
+      expect(names).not.toContain('wipe');
+    });
+
+    it('matches * against any run of characters', async () => {
+      const refs = await listBranchRefs(repo, repoId, {
+        ...options,
+        ignoreBranches: ['release/*'],
+      });
+      expect(refs.map((ref) => ref.name)).not.toContain('release/1.0');
+    });
+
+    it('does not stall on a pattern built to backtrack', async () => {
+      // Ignore patterns come from the repository's own config, so a pattern is
+      // attacker-supplied. Adjacent wildcards backtrack exponentially, and this
+      // one takes tens of seconds against a translation that keeps them apart.
+      const startedAt = Date.now();
+      await listBranchRefs(repo, repoId, {
+        ...options,
+        ignoreBranches: [`${'*'.repeat(24)}x`],
+      });
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+    });
+  });
+
   describe('mergeBase', () => {
     it('finds the common ancestor of two branches', async () => {
       const expected = git(root, 'rev-parse', 'HEAD').trim();
@@ -200,8 +276,12 @@ describe('repo discovery', () => {
       expect(await mergeBase(repo, 'main', 'unrelated', options)).toBeNull();
     });
 
-    it('returns null for a ref that does not exist', async () => {
-      expect(await mergeBase(repo, 'main', 'refs/heads/absent', options)).toBeNull();
+    it('raises for a ref that does not exist rather than reporting no merge-base', async () => {
+      // git exits 1 for no common ancestor and 128 for an unresolvable ref.
+      // Collapsing the two drops the pair from analysis in silence.
+      const error = await rejection(mergeBase(repo, 'main', 'refs/heads/absent', options));
+      expect(error.code).toBe('GIT_COMMAND_FAILED');
+      expect(error.infra).toBe(true);
     });
   });
 });

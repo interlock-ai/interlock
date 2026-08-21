@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { InterlockError, ulid } from '@interlock/shared';
 import type { BranchRef, DirtyState, Repo, RepoId, BranchRefId } from '@interlock/shared';
 import type { AnyRepo, GitResult, GitRunner, UserRepo } from './repo-handle.js';
@@ -13,11 +15,32 @@ export interface DiscoveryOptions {
   readonly runner: GitRunner;
   /** Branch name globs to ignore, from the repo's config override. */
   readonly ignoreBranches?: readonly string[];
-  /** Root of Interlock's data dir; shadow clones live under it. */
-  readonly dataDir?: string;
 }
 
-/** Run a command whose non-zero exit means the repository is unusable. */
+/**
+ * Discovery options for a call that places files on disk.
+ *
+ * `dataDir` is required here and absent from {@link DiscoveryOptions}: without
+ * it a shadow path resolves against the filesystem root.
+ */
+export interface DescribeOptions extends DiscoveryOptions {
+  /** Root of Interlock's data dir; shadow clones live under it. */
+  readonly dataDir: string;
+}
+
+/** The subcommand in a git argv, skipping any leading flags. */
+function verbOf(args: readonly string[]): string {
+  return args.find((arg) => !arg.startsWith('-')) ?? '';
+}
+
+/**
+ * Run a command whose non-zero exit means the repository is unusable.
+ *
+ * git's stderr names branches and paths, which is repository content. It stays
+ * out of the error: `details` is documented as carrying neither secrets nor
+ * file contents, and an `InterlockError` reaches both the API and the agents.
+ * The runner logs the failing command through the redacting sink.
+ */
 async function required(
   runner: GitRunner,
   repo: AnyRepo,
@@ -25,9 +48,9 @@ async function required(
 ): Promise<GitResult> {
   const result = await runner.run(repo, args);
   if (result.exitCode !== 0) {
-    throw new InterlockError('GIT_COMMAND_FAILED', `git ${args[0] ?? ''} failed`, {
-      details: { rootPath: repo.rootPath, exitCode: result.exitCode },
-      remedy: result.stderr.trim().slice(0, 200),
+    throw new InterlockError('GIT_COMMAND_FAILED', `git ${verbOf(args)} failed`, {
+      details: { rootPath: repo.rootPath, command: verbOf(args), exitCode: result.exitCode },
+      remedy: 'Check that the repository is readable and no other git process holds it.',
       infra: true,
     });
   }
@@ -56,8 +79,14 @@ function probeHandle(path: string): UserRepo {
  * above all, must resolve its own side or the two will never match.
  */
 export async function openUserRepo(path: string, options: DiscoveryOptions): Promise<UserRepo> {
-  const probe = probeHandle(path);
+  if (!existsSync(path)) {
+    throw new InterlockError('REPO_NOT_FOUND', `No such path: ${path}`, {
+      details: { path },
+      remedy: 'Point Interlock at a directory that exists.',
+    });
+  }
 
+  const probe = probeHandle(path);
   const bare = await options.runner.run(probe, ['rev-parse', '--is-bare-repository']);
   if (bare.exitCode !== 0) {
     throw new InterlockError('REPO_NOT_GIT', `Not a git repository: ${path}`, {
@@ -73,14 +102,31 @@ export async function openUserRepo(path: string, options: DiscoveryOptions): Pro
     });
   }
 
-  const root = await required(options.runner, probe, ['rev-parse', '--show-toplevel']);
-  const rootPath = root.stdout.trim();
-  const gitDir = await required(options.runner, probeHandle(rootPath), [
+  // `--show-toplevel` answers with the worktree the path sits in, so a linked
+  // worktree would open as a repository of its own — a second `Repo` row and a
+  // second shadow clone for work that is already being watched. git lists the
+  // main worktree first from anywhere in the repository, and that path is the
+  // one identity every worktree agrees on.
+  const worktrees = await required(options.runner, probe, [
+    'worktree',
+    'list',
+    '--porcelain',
+    '-z',
+  ]);
+  const main = parseWorktreeList(worktrees.stdout)[0];
+  if (main === undefined) {
+    throw new InterlockError('REPO_NOT_GIT', `Repository lists no worktree: ${path}`, {
+      details: { path },
+      remedy: 'Point Interlock at a directory inside a git repository.',
+    });
+  }
+
+  const gitDir = await required(options.runner, probeHandle(main.path), [
     'rev-parse',
     '--absolute-git-dir',
   ]);
 
-  return { kind: 'user', rootPath, gitDir: gitDir.stdout.trim() };
+  return { kind: 'user', rootPath: main.path, gitDir: gitDir.stdout.trim() };
 }
 
 /**
@@ -111,7 +157,7 @@ async function resolveDefaultBranch(repo: UserRepo, runner: GitRunner): Promise<
  * Mints a fresh id, so this describes a first sighting. Recognising a repository
  * already seen is a lookup by `rootPath` in the store, not a second call here.
  */
-export async function describeRepo(repo: UserRepo, options: DiscoveryOptions): Promise<Repo> {
+export async function describeRepo(repo: UserRepo, options: DescribeOptions): Promise<Repo> {
   const defaultBranch = await resolveDefaultBranch(repo, options.runner);
   const now = new Date().toISOString();
   const id = ulid<RepoId>();
@@ -127,9 +173,8 @@ export async function describeRepo(repo: UserRepo, options: DiscoveryOptions): P
   };
 }
 
-function shadowPathFor(id: RepoId, dataDir: string | undefined): string {
-  const base = dataDir ?? '';
-  return `${base}/shadows/${id}`.replace(/\/+/gu, '/');
+function shadowPathFor(id: RepoId, dataDir: string): string {
+  return join(dataDir, 'shadows', id);
 }
 
 interface WorktreeEntry {
@@ -181,11 +226,18 @@ function parseWorktreeList(stdout: string): WorktreeEntry[] {
   return entries;
 }
 
+/** Two-letter status codes that mark a path as conflicted. */
+const UNMERGED_CODES: ReadonlySet<string> = new Set(['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU']);
+
 /**
  * Parse `git status --porcelain -z` into staged, unstaged and untracked paths.
  *
  * A rename or copy emits the destination and then the source as two fields, so
  * the source is consumed rather than read as the next entry.
+ *
+ * A conflicted path counts once, as unstaged: both of its columns are non-blank,
+ * so reading them independently would report the same path as staged and
+ * unstaged at the same time. Resolving it is what makes it stageable.
  */
 function parseStatus(stdout: string): {
   staged: string[];
@@ -209,7 +261,13 @@ function parseStatus(stdout: string): {
       untracked.push(path);
       continue;
     }
-    if (index === 'R' || index === 'C') i++;
+    // The source path of a rename or copy, whichever column reported it.
+    if (index === 'R' || index === 'C' || worktree === 'R' || worktree === 'C') i++;
+
+    if (UNMERGED_CODES.has(`${index}${worktree}`)) {
+      unstaged.push(path);
+      continue;
+    }
     if (index !== ' ' && index !== '?') staged.push(path);
     if (worktree !== ' ' && worktree !== '?') unstaged.push(path);
   }
@@ -217,8 +275,15 @@ function parseStatus(stdout: string): {
   return { staged, unstaged, untracked };
 }
 
+/**
+ * Uncommitted work in one worktree.
+ *
+ * A failed `status` is raised rather than read as an empty result: "clean" is
+ * the most dangerous wrong answer here, because nothing downstream looks again
+ * at a branch that reported no changes.
+ */
 async function readDirtyState(worktreePath: string, runner: GitRunner): Promise<DirtyState> {
-  const status = await runner.run(probeHandle(worktreePath), ['status', '--porcelain', '-z']);
+  const status = await required(runner, probeHandle(worktreePath), ['status', '--porcelain', '-z']);
   const { staged, unstaged, untracked } = parseStatus(status.stdout);
 
   return {
@@ -232,15 +297,37 @@ async function readDirtyState(worktreePath: string, runner: GitRunner): Promise<
   };
 }
 
+/** Longest ignore pattern accepted; beyond this the glob is not a glob. */
+const MAX_PATTERN_LENGTH = 200;
+
 /**
- * Match a branch name against a glob supporting `*` only.
+ * Match a branch name against a glob supporting `*` and `?`.
  *
  * Deliberately not a full glob implementation: `core` takes no dependencies,
  * and branch ignore rules in practice are `release/*` and `wip-*`.
+ *
+ * Patterns arrive from a repository's own config, which is written by the
+ * agents Interlock watches, so the translation has to be safe on hostile input.
+ * Runs of `*` collapse to one `.*` because adjacent `.*` groups backtrack
+ * exponentially: sixteen stars against a sixteen-character branch name takes
+ * 25 seconds, and the pattern's author chooses the number of stars.
  */
 function matchesGlob(name: string, pattern: string): boolean {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/gu, '\\$&').replace(/\*/gu, '.*');
-  return new RegExp(`^${escaped}$`, 'u').test(name);
+  if (pattern.length > MAX_PATTERN_LENGTH) return false;
+
+  let source = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern[i]!;
+    if (char === '*') {
+      while (pattern[i + 1] === '*') i++;
+      source += '.*';
+    } else if (char === '?') {
+      source += '.';
+    } else {
+      source += char.replace(/[.+^${}()|[\]\\*?]/gu, '\\$&');
+    }
+  }
+  return new RegExp(`^${source}$`, 'u').test(name);
 }
 
 /**
@@ -335,7 +422,17 @@ export async function mergeBase(
   options: DiscoveryOptions,
 ): Promise<string | null> {
   const result = await options.runner.run(repo, ['merge-base', a, b]);
-  if (result.exitCode !== 0) return null;
+  // Exit 1 is "no common ancestor". Anything else is a ref git could not
+  // resolve, and reporting that as a missing merge-base would drop the pair
+  // from analysis without saying why.
+  if (result.exitCode === 1) return null;
+  if (result.exitCode !== 0) {
+    throw new InterlockError('GIT_COMMAND_FAILED', 'git merge-base failed', {
+      details: { rootPath: repo.rootPath, exitCode: result.exitCode },
+      remedy: 'Check that both refs exist in this repository.',
+      infra: true,
+    });
+  }
 
   const sha = result.stdout.trim();
   return sha === '' ? null : sha;

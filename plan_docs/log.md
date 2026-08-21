@@ -4,6 +4,18 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-08-22
+
+- **Fixed:** `matchesGlob` translated every `*` to its own `.*`, so adjacent wildcards backtracked exponentially — measured 157 ms at ten stars, 25.5 s at sixteen, against a sixteen-character branch name. Ignore patterns come from the repository's own config, which the watched agents write, so a checked-in file could stall the discovery loop for as long as its author liked. Runs of `*` now collapse to one wildcard; the same pattern takes 1 ms.
+- **Fixed:** `?` was missing from the escape set and survived into the regex as a quantifier, so `wip?` kept `wipe` and dropped `wip` — the exact inverse of the glob. It now means one character.
+- **Fixed:** `mergeBase` returned `null` for any non-zero exit. git exits 1 for refs with no common ancestor and 128 for a ref it cannot resolve, so a typo or a stale ref reported as "not comparable" and the pair was dropped from analysis in silence. Only exit 1 is an answer now.
+- **Decided:** a repository has one identity, and it is the main worktree's path. `--show-toplevel` answers with the worktree the path sits in, so opening the same repository through a linked worktree produced a second `Repo` row and a second shadow clone — on M1's main path, whose exit criterion is three worktrees under active edit. git lists the main worktree first from anywhere in the repository, which is the one path every worktree agrees on. The alternative, keying identity on `--git-common-dir` and carrying the worktree separately, would change the handle type and the store schema for no gain here.
+- **Fixed:** `required()` put raw git stderr in `remedy`. stderr names branches and paths, `details` is documented as carrying neither secrets nor file contents, and an `InterlockError` reaches the API and the agents — so the diagnostic is gone from the error and the remedy says what to do. The runner already logs the failing command through the redacting sink.
+- **Fixed:** `dataDir` was optional, so `describeRepo` without one produced a shadow path at the filesystem root. It is required by the type that needs it rather than checked at runtime.
+- **Fixed:** an unmerged path has both status columns non-blank, so it was reported as staged and unstaged at once. It counts once, as unstaged.
+- **Fixed:** `readDirtyState` ignored the exit code, so a failed `status` read as a clean worktree. Unreachable through `listBranchRefs` today — git marks an unreadable worktree prunable and it is dropped first, and an unreadable subdirectory only produces a warning with exit 0 — so the fix is unpinned by a test. Kept anyway: "clean" is the most dangerous wrong answer this function can give.
+- **Rejected:** hardcoding `main` as the last-resort default branch and `origin` as the remote consulted. Both are documented fallbacks for a repository that declares nothing, not guesses that override what a repository does declare. Multiple remotes are a real limitation, and the day one matters is the day the config override lands.
+
 ## 2026-08-21
 
 - **Added:** a test pinning that a SIGTERM the runner did not send is reported as a signal death, not a timeout — a fake git that runs `kill -TERM $$`. Reviewed three times as a live bug and disproved twice by measurement; it is now a test, so it stops being an argument. Conflating the two branches fails it.

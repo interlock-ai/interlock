@@ -55,18 +55,43 @@ every task here and is not repeated per task.
       **Files:** `packages/core/src/git/discovery.ts`
       **What:** `openUserRepo`, `describeRepo`, `listBranchRefs`, `mergeBase`.
 
-  `openUserRepo` resolves the root via `rev-parse --show-toplevel` and rejects a
-  non-repository with `REPO_NOT_GIT` rather than throwing raw. `listBranchRefs`
-  must include linked worktrees from `worktree list --porcelain`, not just
-  `branch --list` — a branch checked out in another worktree is the normal case
-  here, not an edge case. Handle: a repo with no commits, a detached HEAD, a
-  worktree whose directory has been deleted but whose administrative file
-  remains, and a bare repository. `mergeBase` returns `null` when two branches
-  share no history rather than throwing.
+  `openUserRepo` resolves the repository a path belongs to and rejects a
+  non-repository with `REPO_NOT_GIT` rather than throwing raw, a missing path
+  with `REPO_NOT_FOUND`, and a bare one with `REPO_BARE`. `--show-toplevel`
+  answers with the _worktree_, so a repository opened through a linked worktree
+  would get a second identity and a second shadow clone; the root is the main
+  worktree, which git lists first from anywhere in the repository.
+  `listBranchRefs` must include linked worktrees from `worktree list
+--porcelain`, not just `branch --list` — a branch checked out in another
+  worktree is the normal case here, not an edge case. Handle: a repo with no
+  commits, a detached HEAD, a worktree whose directory has been deleted but
+  whose administrative file remains, and a bare repository. `mergeBase` returns
+  `null` only for refs with no common ancestor, which git reports as exit 1; a
+  ref it cannot resolve exits 128 and raises, because a silent `null` would drop
+  the pair from analysis.
+
+  Ignore patterns come from the repository's own `.interlock.json`, which the
+  agents Interlock watches can write, so glob translation is attacker-facing:
+  runs of `*` must collapse to one wildcard or the regex backtracks
+  exponentially.
 
   **Done when:** an integration test builds a repo with two linked worktrees, a
   detached HEAD and an unborn branch, and every function returns correct results
-  or a typed error for each.
+  or a typed error for each; opening the repository through a linked worktree
+  yields the same handle as opening it at its root; and a pathological ignore
+  pattern completes in milliseconds.
+
+- [ ] **Repo config override**
+      **Files:** `packages/core/src/git/discovery.ts`, `packages/shared/src/config.ts`
+      **What:** read `.interlock.json` from the repository root into `Repo.config`.
+
+  `describeRepo` returns an empty `config` today, so "no overrides" and "not
+  read yet" are indistinguishable. The file is repository content: validate it
+  against the schema and reject anything unexpected rather than trusting it, and
+  treat `ignoreBranches` as hostile input — it reaches a regex.
+
+  **Done when:** a repo with no file, a valid file and a malformed file each
+  produce the right result, and the malformed one names what is wrong.
 
 - [ ] **Dirty-state snapshots**
       **Files:** `packages/core/src/git/worktree.ts`

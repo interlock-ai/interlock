@@ -4,6 +4,20 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-08-24
+
+- **Corrected a premise:** the repository already had formatting and coding-style CI — Prettier and type-aware ESLint, on every matrix cell. What it lacked was hardening and shape.
+- **Fixed:** every action was referenced by a mutable tag. The one that mattered is `cla.yml`, a third-party action running under `pull_request_target` with write permissions and repository secrets; moving that tag would have run arbitrary code with the repository's token. All five are pinned by commit SHA with the version in a comment, which Dependabot still updates.
+- **Fixed:** workflows ran with the default writable token. `ci.yml` and `bench.yml` now declare `contents: read`, and every job has a `timeout-minutes` — this suite spawns processes and deliberately kills some, and a wedged one would otherwise hold a runner for six hours. A regression earlier in this session hung the test process for ten minutes, which is what that would have looked like unbounded.
+- **Restructured CI by what actually varies.** Lint, formatting and types are properties of the source, so they run once instead of four times. Tests keep a matrix, but macOS earns one cell rather than an axis: it is where `/var` resolves to `/private/var` and where the watcher will use FSEvents, and its minutes bill at ten times Linux. Four cells became three plus one, and three of the four ESLint runs are gone.
+- **Decided:** CI invokes the same scripts as `pnpm verify`, split into `verify:static` and the test run, rather than a hand-copied list of the same commands. A workflow that reimplements the local gate is how the two end up green while checking different things.
+- **Folded** the coverage job into the test job. A separate job paid a second checkout and install to run the same tests again; `test:coverage` on every cell costs nothing measurable on a six-second suite.
+- **Added** `git --version` to the test job. The flag allowlist is asserted against whatever git the runner ships, and a rendering change in git 2.55 already broke CI once.
+- **Rejected:** `actionlint` and `zizmor` for now. Every `run:` in these workflows is a single `pnpm` invocation, so there is no shell for actionlint to check, and adding third-party actions to lint three files cuts against the pinning just done. Revisit when a workflow grows real shell.
+- **Rejected:** `knip` for now. Half the packages are declared surface that throws `notImplemented`, so it would flag the planned API as dead. It becomes useful once M1 fills those in.
+- **Rejected:** a nightly run against the latest git. Every pull request already runs against the runner image's git, so drift surfaces within a day of an image update, and the allowlist test now parses flag tokens rather than matching prose.
+- **Checked, no change:** fixtures already set `user.name` and `user.email` locally, so they do not depend on a global git identity. `pnpm clean` already removes `.tsbuildinfo` alongside `dist` — deleting `dist` while leaving the build info makes `tsc --build` emit nothing and type-aware lint fail with 55 unresolved-type errors, which is worth recognising rather than fixing.
+
 ## 2026-08-22
 
 - **Fixed:** worktree filtering depended on a porcelain detail. On git 2.39 a locked worktree whose directory is gone prints `locked` and not `prunable`, which is what the code assumed — but whether `worktree list` annotates both has moved between versions, and CI runs 2.55. The filter now skips a worktree that is prunable **and not locked**, which is correct under either behaviour and matches what `worktree prune` actually does. The asymmetry is deliberate: an unlocked missing worktree is garbage awaiting pruning and holds no observable work, a locked one is state someone chose to keep and merely cannot be reached, so it is unknown.

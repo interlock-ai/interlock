@@ -5,27 +5,68 @@ on:
     branches: [main, dev]
   pull_request:
 
+# The default token is writable. Nothing here writes to the repository, and a
+# workflow that cannot write cannot be turned into one that does by a step it
+# runs.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: lint · typecheck · test (node ${{ matrix.node }}, ${{ matrix.os }})
+  # Lint, formatting and types are properties of the source, not of the machine
+  # reading it, so they run once rather than once per matrix cell.
+  static:
+    name: lint · format · typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # The script `pnpm verify` runs locally, so the two cannot drift into
+      # checking different things while both report green. It builds first:
+      # packages resolve each other through `exports` maps pointing at built
+      # output, which type-aware linting and typechecking both need.
+      - name: Verify
+        run: pnpm verify:static
+
+  test:
+    name: test (node ${{ matrix.node }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        # Linux and macOS only; Windows is out of scope.
-        os: [ubuntu-latest, macos-latest]
         # 24 is the floor declared in `engines`; 26 is what development runs on.
-        node: ['24', '26']
+        # macOS earns one cell rather than a full axis: it is where path
+        # canonicalisation differs — `/var` is a symlink to `/private/var` and
+        # git resolves it — and where the watcher will use FSEvents. Nothing
+        # else here is OS-dependent, and macOS minutes bill at ten times Linux.
+        include:
+          - os: ubuntu-latest
+            node: '24'
+          - os: ubuntu-latest
+            node: '26'
+          - os: macos-latest
+            node: '26'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
@@ -33,30 +74,27 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
-      # Packages resolve each other through their `exports` maps, which point at
-      # built output, so type-aware linting and typechecking both need this first.
-      - name: Build
-        run: pnpm build
+      # The flag allowlist is asserted against whatever git the runner image
+      # ships, and git has changed how `-h` renders between versions. When that
+      # assertion fails, the version is the first thing to look at.
+      - name: git version
+        run: git --version
 
-      - name: Lint
-        run: pnpm lint
-
-      - name: Format check
-        run: pnpm format:check
-
-      - name: Typecheck
-        run: pnpm typecheck
-
+      # Vitest resolves the workspace packages to their sources, so the suite
+      # needs no prior build. Coverage runs here rather than in a job of its
+      # own, which would pay a second checkout and install to run the same
+      # tests again.
       - name: Test
-        run: pnpm test
+        run: pnpm test:coverage
 
   audit:
     name: dependency audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .node-version
           cache: pnpm

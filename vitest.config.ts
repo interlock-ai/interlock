@@ -49,6 +49,21 @@ export default defineConfig({
       reporter: ['text', 'lcov'],
       include: ['packages/*/src/**/*.ts'],
       exclude: ['**/*.test.ts', '**/index.ts', '**/*.d.ts'],
+      /**
+       * A floor against regression, not a target. Set just under what the tree
+       * measures so ordinary work never trips it, and raised when a milestone
+       * lands rather than lowered when a change misses.
+       *
+       * `functions` sits lowest because a declared-but-unwritten function
+       * throws `notImplemented` and is never called; that number rises as
+       * milestones replace stubs.
+       */
+      thresholds: {
+        statements: 80,
+        branches: 80,
+        functions: 60,
+        lines: 80,
+      },
     },
   },
 });

@@ -2,15 +2,25 @@ name: Benchmarks
 
 # Budgets: <2% steady-state CPU, <60s to a textual finding, <3min to a typecheck finding.
 
+# Shared-runner numbers are regression smoke — did something get an order of
+# magnitude worse — and never the figures quoted as results. CPU steal on a
+# two-core runner makes a p95 describe the runner. Reported numbers come from a
+# quiet machine.
+#
+# `dev` rather than `main`: `main` is release-only, so a push trigger there
+# would find a regression at release time instead of at the commit. Weekly alone
+# leaves a regression unattributed for up to seven days.
 on:
+  push:
+    branches: [dev]
   schedule:
     - cron: '0 3 * * 1' # Mondays, 03:00 UTC
   workflow_dispatch:
 
-# A superseded run is the most expensive thing to leave benchmarking.
+# Serialised rather than cancelled: a manual dispatch and the weekly run share a
+# ref, so cancel-in-progress would let one kill the other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}
 
 # The default token is writable. Nothing here writes to the repository, and a
 # workflow that cannot write cannot be turned into one that does by a step it
@@ -36,4 +46,7 @@ jobs:
         with:
           name: bench-results
           path: eval/reports/bench-*.json
+          retention-days: 30
+          # `warn` only until there are benchmarks: `pnpm bench` prints the
+          # budgets and writes nothing, so `error` would fail every run.
           if-no-files-found: warn

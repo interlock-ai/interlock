@@ -11,15 +11,17 @@ on:
 permissions:
   contents: read
 
+# Superseding a pull request push is free; superseding a push to a shared branch
+# cancels a run mid-test and leaves that commit unverified.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Lint, formatting and types are properties of the source, not of the machine
-  # reading it, so they run once rather than once per matrix cell.
+  # Building, linting, formatting and types are properties of the source, not of
+  # the machine reading it, so they run once rather than once per matrix cell.
   static:
-    name: lint · format · typecheck
+    name: build · lint · format · typecheck
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -59,6 +61,7 @@ jobs:
             node: '24'
           - os: ubuntu-latest
             node: '26'
+            coverage: true
           - os: macos-latest
             node: '26'
     steps:
@@ -81,10 +84,17 @@ jobs:
         run: git --version
 
       # Vitest resolves the workspace packages to their sources, so the suite
-      # needs no prior build. Coverage runs here rather than in a job of its
-      # own, which would pay a second checkout and install to run the same
-      # tests again.
+      # needs no prior build.
       - name: Test
+        if: ${{ !matrix.coverage }}
+        run: pnpm test
+
+      # The floors are global, so one cell decides them. Enforcing the same
+      # numbers on three platforms buys nothing and, once any branch is
+      # platform-conditional, produces a floor that passes on one and fails on
+      # another. This runs what `pnpm verify` runs.
+      - name: Test with coverage
+        if: ${{ matrix.coverage }}
         run: pnpm test:coverage
 
   audit:
@@ -97,9 +107,21 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+
+      # No install: `pnpm audit` resolves advisories from `pnpm-lock.yaml` and
+      # never reads `node_modules`.
+      #
       # Reported, not a merge gate: an upstream advisory should not block a
-      # change that has nothing to do with it.
-      - run: pnpm audit --audit-level high
+      # change that has nothing to do with it. No scope filter — this repository
+      # ships no runtime dependencies yet, and a compromised dev dependency runs
+      # here with the workflow's token.
+      - name: Audit
+        id: audit
         continue-on-error: true
+        run: pnpm audit --audit-level high
+
+      # A job that can only be green reports to nobody. The annotation surfaces
+      # on the run summary; the findings themselves are in the step above.
+      - name: Report advisories
+        if: steps.audit.outcome == 'failure'
+        run: echo "::warning title=Dependency advisories::pnpm audit reported advisories at high or above - see the Audit step"

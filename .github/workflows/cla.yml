@@ -17,6 +17,11 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened]
 
+# The set the action documents as its requirement. `contents: write` commits the
+# signature to `cla-signatures`, `pull-requests` and `statuses` write the verdict
+# back, and `actions: write` lets it re-run this check when a signature arrives
+# after the pull request opened. This is the one workflow here that runs
+# third-party code with a token, which is why the action is pinned by digest.
 permissions:
   actions: write
   contents: write

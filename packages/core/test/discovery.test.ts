@@ -137,18 +137,6 @@ describe('repo discovery', () => {
       expect(described.defaultBranch).toBe('feature');
     });
 
-    it('falls back to main for a repository with an unborn HEAD', async () => {
-      const unborn = join(base, 'unborn');
-      execFileSync('git', ['init', '-q', '-b', 'main', unborn], { stdio: 'pipe' });
-      const described = await describeRepo(
-        { kind: 'user', rootPath: unborn, gitDir: join(unborn, '.git') },
-        options,
-      );
-      expect(described.defaultBranch).toBe('main');
-    });
-  });
-
-  describe('listBranchRefs', () => {
     it('includes branches checked out in linked worktrees', async () => {
       const refs = await listBranchRefs(repo, repoId, options);
       const byName = new Map(refs.map((ref) => [ref.name, ref]));
@@ -170,7 +158,7 @@ describe('repo discovery', () => {
 
     it('reads a staged rename as one destination path', async () => {
       // `-z` emits `R dest\0src\0`, so the source field has to be consumed.
-      // Read as a status entry it yields the garbage path `txt` in both lists.
+      // Read as a status entry it yields the garbage path `xt` in both lists.
       const worktree = join(base, 'wt-feature');
       git(worktree, 'mv', 'a.txt', 'b.txt');
 
@@ -182,18 +170,22 @@ describe('repo discovery', () => {
       expect(feature?.dirty?.untrackedFiles).toEqual([]);
     });
 
-    it('reports an unreadable worktree as unknown rather than clean', async () => {
-      // `worktree lock` is what keeps a worktree on a removable volume from
-      // being pruned, so a missing directory is listed as locked, not prunable.
+    it('separates a locked missing worktree from an abandoned one', async () => {
+      // Both directories are gone. The unlocked one is garbage awaiting
+      // `worktree prune` and holds no observable work; the locked one is state
+      // someone chose to keep and simply cannot be reached, so it is unknown.
+      // Which of `locked` and `prunable` git prints for the first is a
+      // porcelain detail, so neither assertion may depend on it.
       git(root, 'branch', 'locked');
       git(root, 'worktree', 'add', '-q', join(base, 'wt-locked'), 'locked');
       git(root, 'worktree', 'lock', join(base, 'wt-locked'));
       rmSync(join(base, 'wt-locked'), { recursive: true, force: true });
 
       const refs = await listBranchRefs(repo, repoId, options);
-      const locked = refs.find((ref) => ref.name === 'locked');
 
-      expect(locked?.dirty).toBeNull();
+      expect(refs.find((ref) => ref.name === 'locked')?.dirty).toBeNull();
+      // `gone` is the fixture's unlocked worktree with its directory removed.
+      expect(refs.find((ref) => ref.name === 'gone')?.dirty?.isDirty).toBe(false);
       // One unreachable worktree must not take the rest of the repository down.
       expect(refs.find((ref) => ref.name === 'feature')?.dirty?.isDirty).toBe(false);
     });

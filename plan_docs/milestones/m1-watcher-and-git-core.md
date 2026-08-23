@@ -224,6 +224,13 @@ every task here and is not repeated per task.
   produces a ref event; a rewrite that leaves content unchanged publishes no
   `branch.snapshot`; and two numbers are in `log.md` —
 
+  Decide the per-`status` timeout here, with the latency numbers in hand rather
+  than ahead of them. Discovery reads worktrees serially and a `status` on an
+  unreachable one — a stale network mount, not a deleted directory — burns the
+  runner's full default before returning unknown, so one pathological repo can
+  dominate a sweep. Guessing a shorter bound now would trade that for the worse
+  failure: a slow but working worktree reported as unreadable.
+
   - **idle** CPU with three worktrees on a repo of at least 10,000 files, which
     must stay under 2%;
   - **active** CPU and per-event latency while a script rewrites files in three

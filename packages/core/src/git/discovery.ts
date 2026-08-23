@@ -182,6 +182,7 @@ interface WorktreeEntry {
   readonly path: string;
   readonly ref: string | null;
   readonly prunable: boolean;
+  readonly locked: boolean;
 }
 
 /**
@@ -195,12 +196,14 @@ function parseWorktreeList(stdout: string): WorktreeEntry[] {
   let path: string | null = null;
   let ref: string | null = null;
   let prunable = false;
+  let locked = false;
 
   const flush = (): void => {
-    if (path !== null) entries.push({ path, ref, prunable });
+    if (path !== null) entries.push({ path, ref, prunable, locked });
     path = null;
     ref = null;
     prunable = false;
+    locked = false;
   };
 
   for (const field of stdout.split('\0')) {
@@ -217,6 +220,7 @@ function parseWorktreeList(stdout: string): WorktreeEntry[] {
       path = value;
     } else if (key === 'branch') ref = value;
     else if (key === 'prunable') prunable = true;
+    else if (key === 'locked') locked = true;
   }
   flush();
 
@@ -313,7 +317,10 @@ const MAX_PATTERN_LENGTH = 200;
  * the two lengths.
  *
  * Both sides are compared by code point, so `?` consumes an astral character
- * whole rather than half a surrogate pair.
+ * whole rather than half a surrogate pair. `*` is tested before a literal match
+ * so that it always expands: a name containing a literal `*` would otherwise
+ * consume the wildcard meant to span it. Refnames forbid both characters, so
+ * this only matters if the matcher is reused on something else.
  */
 function matchesGlob(name: string, pattern: string): boolean {
   if (pattern.length > MAX_PATTERN_LENGTH) return false;
@@ -329,13 +336,13 @@ function matchesGlob(name: string, pattern: string): boolean {
 
   while (subjectIndex < subject.length) {
     const globChar = glob[globIndex];
-    if (globChar === '?' || (globChar !== undefined && globChar === subject[subjectIndex])) {
-      globIndex++;
-      subjectIndex++;
-    } else if (globChar === '*') {
+    if (globChar === '*') {
       starIndex = globIndex;
       globIndex++;
       resumeIndex = subjectIndex;
+    } else if (globChar === '?' || (globChar !== undefined && globChar === subject[subjectIndex])) {
+      globIndex++;
+      subjectIndex++;
     } else if (starIndex !== -1) {
       globIndex = starIndex + 1;
       resumeIndex++;
@@ -377,7 +384,14 @@ export async function listBranchRefs(
   const worktrees = await required(options.runner, repo, ['worktree', 'list', '--porcelain', '-z']);
   const byRef = new Map<string, WorktreeEntry>();
   for (const entry of parseWorktreeList(worktrees.stdout)) {
-    if (entry.prunable || entry.ref === null) continue;
+    // A missing directory means two different things depending on the lock.
+    // Unlocked, the worktree is garbage awaiting `worktree prune` and holds no
+    // observable work. Locked, it is state someone deliberately preserved —
+    // which is what a worktree on a removable volume is locked for — so it is
+    // unreachable rather than absent, and its dirty state is unknown.
+    // `worktree prune` consults the lock; whether `worktree list` annotates
+    // both is a porcelain detail that has moved between versions.
+    if ((entry.prunable && !entry.locked) || entry.ref === null) continue;
     byRef.set(entry.ref, entry);
   }
 

@@ -1,11 +1,13 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { InterlockError } from './errors.js';
+import { LOG_LEVELS } from './logger.js';
 import type { LogLevel } from './logger.js';
 import type { RepoConfigOverride } from './models/repo.js';
 
 /**
- * Global configuration schema, defaults and validation.
+ * Configuration: the global schema with its defaults and validation, and the
+ * per-repository override file layered on top of it.
  *
  * Validated by hand rather than with a schema library because `shared` is
  * zero-dep and the surface is small. Revisit if this file grows past a few
@@ -153,7 +155,9 @@ export function parseRepoConfigOverride(source: string, path: string): RepoConfi
   const problems: string[] = [];
   let parsed: unknown;
   try {
-    parsed = JSON.parse(source);
+    // A leading byte-order mark is not whitespace to `JSON.parse`, and editors
+    // on some platforms write one without being asked.
+    parsed = JSON.parse(source.replace(/^\uFEFF/u, ''));
   } catch {
     throw repoConfigInvalid(['file is not valid JSON'], path);
   }
@@ -213,7 +217,7 @@ function readPatternList(
       patterns.push(entry);
     }
   }
-  return patterns;
+  return patterns.length === 0 ? undefined : patterns;
 }
 
 function readToolchain(
@@ -245,11 +249,18 @@ function readToolchain(
     ...(build === undefined ? {} : { build }),
     ...(test === undefined ? {} : { test }),
   };
-  // An empty object and an absent key mean the same thing; keeping both shapes
-  // leaves every reader to handle two spellings of nothing.
+  // An absent key and one holding nothing mean the same thing, so only the
+  // absent spelling survives — as with an empty `ignore` array. Two shapes for
+  // nothing leaves every reader to handle both.
   return Object.keys(toolchain).length === 0 ? undefined : toolchain;
 }
 
+/**
+ * One toolchain command.
+ *
+ * No length limit of its own: unlike a pattern, a command is not matched
+ * against every branch, so the ceiling on the file is the only bound it needs.
+ */
 function readCommand(
   source: Record<string, unknown>,
   key: (typeof TOOLCHAIN_KEYS)[number],
@@ -308,26 +319,101 @@ export function resolveConfig(input: DeepPartial<InterlockConfig> = {}): Interlo
   return config;
 }
 
-/** Returns a list of human-readable problems; empty means valid. */
+/**
+ * Returns a list of human-readable problems; empty means valid.
+ *
+ * Types are checked before ranges, because the config arrives through
+ * `JSON.parse` and every field is `unknown` at run time whatever the interface
+ * says. A range test on the wrong type never fires — `'abc' < 0` is false — and
+ * the value then poisons the arithmetic that reads it: a string `debounceMs`
+ * makes every deadline `NaN`, which is a debounce that silently never fires.
+ */
 export function validateConfig(config: InterlockConfig): string[] {
   const problems: string[] = [];
 
-  for (const repo of config.repos) {
-    if (!repo.startsWith('/')) problems.push(`repo path must be absolute: ${repo}`);
+  if (!Array.isArray(config.repos)) {
+    problems.push('repos must be an array of absolute paths');
+  } else {
+    for (const [index, repo] of config.repos.entries()) {
+      if (typeof repo !== 'string') problems.push(`repos[${String(index)}] must be a string`);
+      else if (!repo.startsWith('/')) problems.push(`repo path must be absolute: ${repo}`);
+    }
   }
-  if (!isPort(config.daemon.port)) problems.push(`daemon.port out of range: ${config.daemon.port}`);
-  if (!isPort(config.mcp.port)) problems.push(`mcp.port out of range: ${config.mcp.port}`);
+
+  if (typeof config.dataDir !== 'string' || config.dataDir === '') {
+    problems.push('dataDir must be a non-empty path');
+  }
+  if (!(LOG_LEVELS as readonly string[]).includes(config.logLevel)) {
+    problems.push(`logLevel must be one of ${LOG_LEVELS.join(', ')}`);
+  }
+
+  if (!isPort(config.daemon.port))
+    problems.push(`daemon.port out of range: ${String(config.daemon.port)}`);
+  if (!isPort(config.mcp.port)) problems.push(`mcp.port out of range: ${String(config.mcp.port)}`);
   if (config.daemon.port === config.mcp.port) problems.push('daemon.port and mcp.port must differ');
-  if (config.scheduler.debounceMs < 0) problems.push('scheduler.debounceMs must be >= 0');
-  if (config.scheduler.concurrency < 1) problems.push('scheduler.concurrency must be >= 1');
-  if (config.scheduler.maxBranches < 2) problems.push('scheduler.maxBranches must be >= 2');
-  if (config.sandbox.cpuLimit <= 0) problems.push('sandbox.cpuLimit must be > 0');
-  if (config.sandbox.memoryLimitMb < 512) problems.push('sandbox.memoryLimitMb must be >= 512');
-  if (config.sandbox.timeoutMs < 1_000) problems.push('sandbox.timeoutMs must be >= 1000');
-  if (config.mcp.maxWarningsPerHour < 0) problems.push('mcp.maxWarningsPerHour must be >= 0');
+
+  requireNumber(
+    config.scheduler.debounceMs,
+    'scheduler.debounceMs',
+    'must be >= 0',
+    (n) => n >= 0,
+    problems,
+  );
+  requireNumber(
+    config.scheduler.concurrency,
+    'scheduler.concurrency',
+    'must be >= 1',
+    (n) => n >= 1,
+    problems,
+  );
+  requireNumber(
+    config.scheduler.overlapPriorityBoost,
+    'scheduler.overlapPriorityBoost',
+    'must be >= 0',
+    (n) => n >= 0,
+    problems,
+  );
+  requireNumber(
+    config.scheduler.maxBranches,
+    'scheduler.maxBranches',
+    'must be >= 2',
+    (n) => n >= 2,
+    problems,
+  );
+  requireNumber(config.sandbox.cpuLimit, 'sandbox.cpuLimit', 'must be > 0', (n) => n > 0, problems);
+  requireNumber(
+    config.sandbox.memoryLimitMb,
+    'sandbox.memoryLimitMb',
+    'must be >= 512',
+    (n) => n >= 512,
+    problems,
+  );
+  requireNumber(
+    config.sandbox.timeoutMs,
+    'sandbox.timeoutMs',
+    'must be >= 1000',
+    (n) => n >= 1_000,
+    problems,
+  );
+  requireNumber(
+    config.mcp.maxWarningsPerHour,
+    'mcp.maxWarningsPerHour',
+    'must be >= 0',
+    (n) => n >= 0,
+    problems,
+  );
+
+  for (const key of ['textual', 'typecheck', 'build', 'testTargeted', 'astSemantic'] as const) {
+    requireBoolean(config.analyzers[key], `analyzers.${key}`, problems);
+  }
+  requireBoolean(config.sandbox.enabled, 'sandbox.enabled', problems);
+  requireBoolean(config.mcp.enabled, 'mcp.enabled', problems);
+  if (typeof config.sandbox.image !== 'string' || config.sandbox.image === '') {
+    problems.push('sandbox.image must be a non-empty string');
+  }
 
   // Execution analyzers require the sandbox: merged code never runs on the host.
-  if (!config.sandbox.enabled) {
+  if (config.sandbox.enabled === false) {
     const needsSandbox = (['typecheck', 'build', 'testTargeted'] as const).filter(
       (key) => config.analyzers[key],
     );
@@ -339,6 +425,25 @@ export function validateConfig(config: InterlockConfig): string[] {
   }
 
   return problems;
+}
+
+/** Records a problem unless the value is a finite number inside its range. */
+function requireNumber(
+  value: number,
+  name: string,
+  expectation: string,
+  inRange: (value: number) => boolean,
+  problems: string[],
+): void {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    problems.push(`${name} must be a number`);
+    return;
+  }
+  if (!inRange(value)) problems.push(`${name} ${expectation}`);
+}
+
+function requireBoolean(value: boolean, name: string, problems: string[]): void {
+  if (typeof value !== 'boolean') problems.push(`${name} must be true or false`);
 }
 
 function isPort(value: number): boolean {

@@ -66,6 +66,63 @@ function problemsFrom(source: string): string[] {
   }
 }
 
+describe('validateConfig', () => {
+  const { scheduler: S, sandbox: B, mcp: M } = DEFAULT_CONFIG;
+
+  it('refuses a value of the wrong type before testing its range', () => {
+    // The config arrives through JSON.parse, so a range test can be handed a
+    // string, where it never fires and the value poisons the arithmetic that
+    // reads it: a string debounce makes every deadline NaN.
+    const problems = validateConfig({
+      ...DEFAULT_CONFIG,
+      scheduler: { ...DEFAULT_CONFIG.scheduler, debounceMs: 'abc' as unknown as number },
+    });
+    expect(problems).toEqual(['scheduler.debounceMs must be a number']);
+  });
+
+  it.each([
+    ['logLevel outside its union', { logLevel: 'shout' }, 'logLevel must be one of'],
+    ['a non-array repos', { repos: 'dist' }, 'repos must be an array'],
+    ['an empty dataDir', { dataDir: '' }, 'dataDir must be a non-empty path'],
+  ])('refuses %s', (_name, patch, expected) => {
+    const problems = validateConfig({ ...DEFAULT_CONFIG, ...patch } as never);
+    expect(problems.join('; ')).toContain(expected);
+  });
+
+  it('refuses a non-boolean analyzer flag', () => {
+    const problems = validateConfig({
+      ...DEFAULT_CONFIG,
+      analyzers: { ...DEFAULT_CONFIG.analyzers, textual: 'yes' as unknown as boolean },
+    });
+    expect(problems).toContain('analyzers.textual must be true or false');
+  });
+
+  it('refuses the daemon and mcp sharing a port', () => {
+    // A constraint between two sections rather than within one, so nothing
+    // else in the file exercises the path that reads both.
+    const problems = validateConfig({
+      ...DEFAULT_CONFIG,
+      mcp: { ...DEFAULT_CONFIG.mcp, port: DEFAULT_CONFIG.daemon.port },
+    });
+    expect(problems).toContain('daemon.port and mcp.port must differ');
+  });
+
+  it.each([
+    ['scheduler.concurrency must be >= 1', { scheduler: { ...S, concurrency: 0 } }],
+    ['scheduler.maxBranches must be >= 2', { scheduler: { ...S, maxBranches: 1 } }],
+    [
+      'scheduler.overlapPriorityBoost must be >= 0',
+      { scheduler: { ...S, overlapPriorityBoost: -1 } },
+    ],
+    ['sandbox.cpuLimit must be > 0', { sandbox: { ...B, cpuLimit: 0 } }],
+    ['sandbox.memoryLimitMb must be >= 512', { sandbox: { ...B, memoryLimitMb: 8 } }],
+    ['sandbox.timeoutMs must be >= 1000', { sandbox: { ...B, timeoutMs: 10 } }],
+    ['mcp.maxWarningsPerHour must be >= 0', { mcp: { ...M, maxWarningsPerHour: -1 } }],
+  ])('refuses %s', (expected, patch) => {
+    expect(validateConfig({ ...DEFAULT_CONFIG, ...patch })).toContain(expected);
+  });
+});
+
 describe('parseRepoConfigOverride', () => {
   const parse = (source: string): unknown =>
     parseRepoConfigOverride(source, '/repo/.interlock.json');
@@ -88,6 +145,18 @@ describe('parseRepoConfigOverride', () => {
 
   it('reads an empty object as no overrides', () => {
     expect(parse('{}')).toEqual({});
+  });
+
+  it.each([
+    ['an empty toolchain', { toolchain: {} }],
+    ['an empty ignore list', { ignore: [] }],
+  ])('drops %s rather than keeping a second spelling of nothing', (_name, value) => {
+    expect(parse(JSON.stringify(value))).toEqual({});
+  });
+
+  it('tolerates a leading byte-order mark', () => {
+    // Not whitespace to JSON.parse, and some editors write one unasked.
+    expect(parse(`\uFEFF{"ignore":["dist"]}`)).toEqual({ ignore: ['dist'] });
   });
 
   it.each([

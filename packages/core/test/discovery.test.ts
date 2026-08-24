@@ -1,5 +1,13 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MAX_REPO_CONFIG_BYTES, ulid } from '@interlock/shared';
@@ -369,6 +377,24 @@ describe('repo discovery', () => {
       writeFileSync(configPath(), document + ' '.repeat(MAX_REPO_CONFIG_BYTES - document.length));
 
       expect((await describeRepo(repo, options)).config.ignore).toEqual(['dist']);
+    });
+
+    it('keeps the errno when the file cannot be opened', async () => {
+      // EACCES, EMFILE and ENOSPC all reach the same branch and are not the
+      // same problem to whoever has to fix one.
+      writeFileSync(configPath(), '{}');
+      chmodSync(configPath(), 0o000);
+
+      try {
+        const error = await rejection(describeRepo(repo, options));
+        expect(error.code).toBe('CONFIG_INVALID');
+        expect(error.message).toContain('could not be opened');
+        expect(error.details.code).toBe('EACCES');
+        // Repository state, not a broken environment.
+        expect(error.infra).toBe(false);
+      } finally {
+        chmodSync(configPath(), 0o644);
+      }
     });
 
     it('reads the file in the main worktree when opened through a linked one', async () => {

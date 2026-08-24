@@ -3,8 +3,6 @@ import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
-
-const { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } = constants;
 import {
   InterlockError,
   isInterlockError,
@@ -196,6 +194,26 @@ export async function describeRepo(repo: UserRepo, options: DescribeOptions): Pr
 }
 
 /**
+ * Flags for opening a file whose path and contents the repository controls.
+ *
+ * POSIX-only, in line with the rest of this suite. Both flags are security
+ * decisions, and on a platform lacking them `O_RDONLY | undefined` degrades to
+ * a plain read that follows symlinks and blocks on fifos — so their absence is
+ * refused here rather than discovered as a missing defence.
+ */
+const OPEN_UNTRUSTED = ((): number => {
+  const { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } = constants;
+  if (O_NOFOLLOW === undefined || O_NONBLOCK === undefined) {
+    throw new InterlockError(
+      'CONFIG_INVALID',
+      'This platform does not support opening a file without following symlinks',
+      { remedy: 'Run Interlock on Linux or macOS.', infra: true },
+    );
+  }
+  return O_RDONLY | O_NONBLOCK | O_NOFOLLOW;
+})();
+
+/**
  * Read the repository's override file, or an empty override when there is none.
  *
  * Malformed is refused rather than ignored. The file decides which branches go
@@ -218,14 +236,14 @@ async function readRepoConfig(rootPath: string): Promise<RepoConfigOverride> {
 
   let handle;
   try {
-    handle = await open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+    handle = await open(path, OPEN_UNTRUSTED);
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
+    const code = (error as NodeJS.ErrnoException).code ?? null;
     if (code === 'ENOENT') return {};
     if (code === 'ELOOP') {
       throw configProblem(path, `${REPO_CONFIG_FILENAME} must not be a symlink`);
     }
-    throw configProblem(path, `${REPO_CONFIG_FILENAME} could not be opened`);
+    throw configProblem(path, `${REPO_CONFIG_FILENAME} could not be opened`, code);
   }
 
   try {
@@ -234,6 +252,15 @@ async function readRepoConfig(rootPath: string): Promise<RepoConfigOverride> {
       throw configProblem(path, `${REPO_CONFIG_FILENAME} is not a regular file`);
     }
     return parseRepoConfigOverride(await readCapped(handle, path), path);
+  } catch (error) {
+    // A read that fails midway is still a problem with this file, and shaping
+    // it here keeps every exit from this function the same kind of error.
+    if (isInterlockError(error)) throw error;
+    throw configProblem(
+      path,
+      `${REPO_CONFIG_FILENAME} could not be read`,
+      (error as NodeJS.ErrnoException).code ?? null,
+    );
   } finally {
     // A failure to close a read handle is not actionable, and letting it throw
     // here would replace the diagnostic this function exists to produce.
@@ -273,9 +300,9 @@ async function readCapped(handle: FileHandle, path: string): Promise<string> {
  * Not `infra`: an unreadable file inside a watched repository is repository
  * state, and the infra flag is for a broken environment.
  */
-function configProblem(path: string, message: string): InterlockError {
+function configProblem(path: string, message: string, code: string | null = null): InterlockError {
   return new InterlockError('CONFIG_INVALID', message, {
-    details: { path },
+    details: { path, code },
     remedy: `Replace ${path} with a readable JSON file, or delete it to fall back to the global configuration.`,
   });
 }

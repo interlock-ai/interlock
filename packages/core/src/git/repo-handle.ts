@@ -692,3 +692,33 @@ export function createGitRunner(options: GitRunnerOptions = {}): GitRunner {
     },
   };
 }
+
+/**
+ * Run a command whose non-zero exit means the repository is unusable.
+ *
+ * The runner returns a non-zero exit as a result rather than throwing, because
+ * for most commands that is an answer — `merge-tree` reports conflicts that
+ * way. Callers that cannot continue without the output say so with this.
+ *
+ * git's stderr names branches and paths, which is repository content. It stays
+ * out of the error: `details` is documented as carrying neither secrets nor
+ * file contents, and an `InterlockError` reaches both the API and the agents.
+ * The runner logs the failing command through the redacting sink.
+ */
+export async function runRequired(
+  runner: GitRunner,
+  repo: AnyRepo,
+  args: readonly string[],
+  options: GitRunOptions = {},
+): Promise<GitResult> {
+  const result = await runner.run(repo, args, options);
+  if (result.exitCode !== 0) {
+    const command = subcommandOf(args);
+    throw new InterlockError('GIT_COMMAND_FAILED', `git ${command ?? ''} failed`, {
+      details: { rootPath: repo.rootPath, command, exitCode: result.exitCode },
+      remedy: 'Check that the repository is readable and no other git process holds it.',
+      infra: true,
+    });
+  }
+  return result;
+}

@@ -104,7 +104,7 @@ every task here and is not repeated per task.
   `listBranchRefs` takes its own option and the watcher does not exist — so a
   repository's rules are stored and not yet honoured. The watcher wires both.
 
-- [ ] **Dirty-state snapshots**
+- [x] **Dirty-state snapshots**
       **Files:** `packages/core/src/git/worktree.ts`
       **What:** `captureDirtyState` — turn uncommitted work into a tree object
       without touching the user's index.
@@ -124,14 +124,26 @@ every task here and is not repeated per task.
   Two paths, because `add -A` over a whole worktree is not free and sits on the
   hot path of every debounced event:
 
-  - **Scoped (common):** `read-tree HEAD` to seed the temp index, then
-    `add -A -- <paths the watcher reported>`, then `write-tree`. This turns a
-    whole-tree scan into a change-sized one. **The seeding step is not optional** —
-    a scoped `add` into an empty index produces a tree containing only those
-    paths, which is a silently corrupt snapshot rather than a slow one.
-  - **Whole-tree (fallback):** plain `add -A` on the first snapshot for a
-    worktree, and whenever the watcher has degraded to polling and cannot say
-    which paths changed.
+  - **Scoped (common):** `read-tree <previous snapshot's tree>` to seed the temp
+    index, then `add -A -- <paths the watcher reported>`, then `write-tree`.
+    This turns a whole-tree scan into a change-sized one. **The seed is the
+    previous snapshot, not `HEAD`** — seeding from `HEAD` drops every
+    uncommitted change outside the reported paths, which is a tree that is wrong
+    rather than merely stale, and staging into an empty index is worse still: a
+    tree holding only the reported paths. A scoped capture is therefore only
+    expressible with the tree it extends.
+  - **Whole-tree (fallback):** seed from `HEAD` and `add -A` with no pathspec —
+    the first snapshot for a worktree, whenever the watcher has degraded to
+    polling, and whenever the base tree has been collected. Seeding from `HEAD`
+    rather than an empty index also keeps a file that is tracked despite
+    matching `.gitignore`, which a rebuild from the worktree alone would drop.
+
+  Filter the reported paths through `status --porcelain -z` before staging them.
+  `git add` refuses a path it is told to add that is ignored, and fails outright
+  on one matching nothing — a file created and deleted inside a debounce window.
+  Both are ordinary watcher output and both would fail the capture; `status`
+  reports neither. Both halves of a rename have to be reported, because a
+  pathspec narrows git's rename detection too.
 
   Objects written this way are unreferenced until something points at them, so a
   user running `git gc --prune=now` can collect a tree Interlock is still holding.
@@ -144,6 +156,11 @@ every task here and is not repeated per task.
 --porcelain`, the index mtime and `.git/index` contents are byte-identical to
   before. A second test kills the operation between `add` and `write-tree` and
   asserts the same.
+
+  Read the index with `fs` and before running any git command in the assertion:
+  `git status` rewrites `.git/index` to refresh its stat cache, leaving the
+  contents identical and moving the mtime, so an observation interleaved with
+  the measurement is what fails the assertion.
   **Constraints:** this is the most dangerous function in the codebase. If it
   writes the user's index, Interlock has corrupted work in progress that was
   never committed and cannot be recovered.

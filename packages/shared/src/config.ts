@@ -2,6 +2,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { InterlockError } from './errors.js';
 import type { LogLevel } from './logger.js';
+import type { RepoConfigOverride } from './models/repo.js';
 
 /**
  * Global configuration schema, defaults and validation.
@@ -97,6 +98,161 @@ export const DEFAULT_CONFIG: InterlockConfig = {
   mcp: { enabled: true, port: 47318, maxWarningsPerHour: 10 },
   logLevel: 'info',
 };
+
+/** Name of the per-repository override file, read from the repository root. */
+export const REPO_CONFIG_FILENAME = '.interlock.json';
+
+/**
+ * Ceiling on the override file.
+ *
+ * The file is repository content, so its size is chosen by whoever writes the
+ * repository. Reading it into memory before deciding it is too large is the
+ * thing the ceiling exists to prevent.
+ */
+export const MAX_REPO_CONFIG_BYTES = 64 * 1024;
+
+/**
+ * Ceiling on one ignore pattern.
+ *
+ * Enforced again where patterns are matched, because a matcher must be safe on
+ * input that never passed through here. Rejecting the pattern at the boundary
+ * is what makes it visible: a pattern silently too long to ever match is the
+ * same as a typo nobody is told about.
+ */
+export const MAX_IGNORE_PATTERN_LENGTH = 200;
+
+/**
+ * Ceiling on how many ignore patterns a repository may declare.
+ *
+ * Every pattern is tried against every branch, so the two multiply.
+ */
+export const MAX_IGNORE_PATTERNS = 256;
+
+const REPO_CONFIG_KEYS = ['ignore', 'ignoreBranches', 'toolchain'] as const;
+const TOOLCHAIN_KEYS = ['install', 'typecheck', 'build', 'test'] as const;
+
+/**
+ * Parse a repository's override file.
+ *
+ * Every field is checked rather than trusted: the file is written by the agents
+ * Interlock watches, and `ignoreBranches` decides which branches go unexamined.
+ * An unrecognised key is a problem rather than something to ignore — a typo
+ * that quietly does nothing is indistinguishable from a setting that was never
+ * applied.
+ *
+ * Problems name the key and the shape expected, never the value found. The file
+ * may contain anything, and an `InterlockError` reaches the API and the agents.
+ *
+ * @throws InterlockError `CONFIG_INVALID` listing every problem at once.
+ */
+export function parseRepoConfigOverride(source: string, path: string): RepoConfigOverride {
+  const problems: string[] = [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    throw repoConfigInvalid(['file is not valid JSON'], path);
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw repoConfigInvalid(['top level must be a JSON object'], path);
+  }
+
+  const record = parsed as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!(REPO_CONFIG_KEYS as readonly string[]).includes(key)) {
+      problems.push(`unknown key: ${key}`);
+    }
+  }
+
+  const ignore = readPatternList(record, 'ignore', problems);
+  const ignoreBranches = readPatternList(record, 'ignoreBranches', problems);
+  const toolchain = readToolchain(record, problems);
+
+  if (problems.length > 0) throw repoConfigInvalid(problems, path);
+
+  return {
+    ...(ignore === undefined ? {} : { ignore }),
+    ...(ignoreBranches === undefined ? {} : { ignoreBranches }),
+    ...(toolchain === undefined ? {} : { toolchain }),
+  };
+}
+
+function readPatternList(
+  record: Record<string, unknown>,
+  key: 'ignore' | 'ignoreBranches',
+  problems: string[],
+): readonly string[] | undefined {
+  const value = record[key];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    problems.push(`${key} must be an array of strings`);
+    return undefined;
+  }
+  if (value.length > MAX_IGNORE_PATTERNS) {
+    problems.push(
+      `${key} has ${String(value.length)} entries, more than ${String(MAX_IGNORE_PATTERNS)}`,
+    );
+    return undefined;
+  }
+
+  const patterns: string[] = [];
+  for (const [index, entry] of value.entries()) {
+    const at = `${key}[${String(index)}]`;
+    if (typeof entry !== 'string') {
+      problems.push(`${at} must be a string`);
+    } else if (entry === '') {
+      problems.push(`${at} must not be empty`);
+    } else if (entry.length > MAX_IGNORE_PATTERN_LENGTH) {
+      problems.push(`${at} is longer than ${String(MAX_IGNORE_PATTERN_LENGTH)} characters`);
+    } else {
+      patterns.push(entry);
+    }
+  }
+  return patterns;
+}
+
+function readToolchain(
+  record: Record<string, unknown>,
+  problems: string[],
+): RepoConfigOverride['toolchain'] | undefined {
+  const value = record.toolchain;
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    problems.push('toolchain must be a JSON object');
+    return undefined;
+  }
+
+  const source = value as Record<string, unknown>;
+  for (const key of Object.keys(source)) {
+    if (!(TOOLCHAIN_KEYS as readonly string[]).includes(key)) {
+      problems.push(`unknown key: toolchain.${key}`);
+    }
+  }
+
+  const commands: Record<string, string> = {};
+  for (const key of TOOLCHAIN_KEYS) {
+    const command = source[key];
+    if (command === undefined) continue;
+    if (typeof command !== 'string' || command === '') {
+      problems.push(`toolchain.${key} must be a non-empty string`);
+      continue;
+    }
+    commands[key] = command;
+  }
+  return commands;
+}
+
+function repoConfigInvalid(problems: string[], path: string): InterlockError {
+  return new InterlockError(
+    'CONFIG_INVALID',
+    `Invalid ${REPO_CONFIG_FILENAME}: ${problems.join('; ')}`,
+    {
+      details: { path, problems },
+      remedy: `Fix ${path}, or delete it to fall back to the global configuration.`,
+    },
+  );
+}
 
 /** Standard config file location. Repos may override a subset via `.interlock.json`. */
 export function configPath(dataDir: string = DEFAULT_DATA_DIR): string {

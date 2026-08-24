@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ulid } from '@interlock/shared';
+import { MAX_REPO_CONFIG_BYTES, ulid } from '@interlock/shared';
 import type { RepoId } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { describeRepo, listBranchRefs, mergeBase, openUserRepo } from '../src/git/discovery.js';
@@ -280,6 +280,68 @@ describe('repo discovery', () => {
       } finally {
         rmSync(plain, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('the repository override file', () => {
+    const configPath = (): string => join(root, '.interlock.json');
+
+    it('reads no file as no overrides', async () => {
+      expect((await describeRepo(repo, options)).config).toEqual({});
+    });
+
+    it('reads a valid file into the repo', async () => {
+      writeFileSync(
+        configPath(),
+        JSON.stringify({ ignoreBranches: ['release/*'], toolchain: { test: 'pnpm test' } }),
+      );
+
+      expect((await describeRepo(repo, options)).config).toEqual({
+        ignoreBranches: ['release/*'],
+        toolchain: { test: 'pnpm test' },
+      });
+    });
+
+    it('refuses a malformed file and names what is wrong', async () => {
+      // Falling back to the defaults would watch branches the repository asked
+      // Interlock to leave alone, and say nothing about why.
+      writeFileSync(configPath(), '{ "ignoreBranches": "release/*" }');
+
+      const error = await rejection(describeRepo(repo, options));
+
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.message).toContain('ignoreBranches must be an array of strings');
+      expect(error.remedy).toContain('.interlock.json');
+    });
+
+    it('refuses a file larger than the ceiling', async () => {
+      writeFileSync(configPath(), JSON.stringify({ ignore: ['x'.repeat(MAX_REPO_CONFIG_BYTES)] }));
+
+      const error = await rejection(describeRepo(repo, options));
+
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.message).toContain('too large');
+    });
+
+    it('refuses something that is not a regular file', async () => {
+      // A size check cannot catch a directory, a fifo, or a symlink to a
+      // character device whose size reads as zero and whose read never ends.
+      mkdirSync(configPath());
+
+      const error = await rejection(describeRepo(repo, options));
+
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.message).toContain('not a regular file');
+    });
+
+    it('reads the file in the main worktree when opened through a linked one', async () => {
+      // Both handles name one repository, so both must see one configuration.
+      writeFileSync(configPath(), JSON.stringify({ ignoreBranches: ['wip-*'] }));
+      const viaWorktree = await openUserRepo(join(base, 'wt-feature'), options);
+
+      expect((await describeRepo(viaWorktree, options)).config).toEqual({
+        ignoreBranches: ['wip-*'],
+      });
     });
   });
 

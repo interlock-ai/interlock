@@ -87,7 +87,7 @@ every task here and is not repeated per task.
   yields the same handle as opening it at its root; and a pathological ignore
   pattern completes in milliseconds.
 
-- [ ] **Repo config override**
+- [x] **Repo config override**
       **Files:** `packages/core/src/git/discovery.ts`, `packages/shared/src/config.ts`
       **What:** read `.interlock.json` from the repository root into `Repo.config`.
 
@@ -98,6 +98,11 @@ every task here and is not repeated per task.
 
   **Done when:** a repo with no file, a valid file and a malformed file each
   produce the right result, and the malformed one names what is wrong.
+
+  Reading the file into `Repo.config` is where this task ends. Nothing passes
+  `config.ignoreBranches` to `listBranchRefs` yet, which takes its own option —
+  so a repository's ignore rules are stored and not yet applied. The caller that
+  wires the two is the watcher.
 
 - [ ] **Dirty-state snapshots**
       **Files:** `packages/core/src/git/worktree.ts`
@@ -193,6 +198,10 @@ every task here and is not repeated per task.
       **Files:** `packages/daemon/src/watcher/`
       **What:** filesystem events plus git ref changes, debounced, publishing
       `worktree.changed`.
+
+  Pass the repository's `config.ignoreBranches` into `listBranchRefs`. It is
+  read into `Repo.config` already and applied nowhere, so until this lands a
+  repository that asked for a branch to be left alone is watched anyway.
 
   Ignore `.git/` internals except `refs/` and `HEAD`, and honour `.gitignore` —
   watching `node_modules` is the difference between 2% CPU and 100%. Debounce

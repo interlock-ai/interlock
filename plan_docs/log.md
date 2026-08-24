@@ -6,6 +6,13 @@ Short entries: done, decided, blocked. Newest first.
 
 ## 2026-08-24
 
+- **Fixed, and the comment claiming it was handled was wrong:** `readRepoConfig` opened the file before checking what it was, so a `.interlock.json` created with `mkfifo` blocked at `open` waiting for a writer and never reached the `isFile` guard the comment credited. Measured: the plain open never returned and held the process; with `O_NONBLOCK` it returns at once and `isFile` refuses it. Removing the flag now fails the test after 30 s, which is the shape of the bug.
+- **Fixed:** the file was followed through a symlink. Pointed at a docker config outside the repository, the parse refused it — and named `auths` and `credsStore` in the error, so the key structure of an arbitrary readable file came back one file per attempt. Values never leaked, which was the rule that held; key names were not covered by it. `O_NOFOLLOW` refuses the link instead. The skill already carried this lesson for `indexFile` and it was not applied here.
+- **Fixed:** the size ceiling gated on `st_size` and then read to EOF regardless, so any file whose reported size understates its readable length walked past both checks — every procfs file reports zero, and CI runs ubuntu. The read is now bounded to the ceiling plus one byte, in a loop because a single `read` may return short.
+- **Fixed:** an unreadable override file was reported `infra: true`. Infra is for a broken environment; a file inside a watched repository is repository state.
+- **Fixed:** `{"toolchain": {}}` round-tripped to `toolchain: {}`, giving an absent key and an empty object two shapes for the same meaning. The key is dropped when no command survives, and the object is built field by field so the compiler enforces the key set the loop was enforcing by hand.
+- **Noted:** `JSON.parse` keeps the last of a repeated key, so a file declaring `ignore` twice parses as valid. Recorded in the doc comment rather than fixed — "every problem at once" sets an expectation this one case cannot meet without a streaming parser.
+
 - **Done:** M1 repo config override. `describeRepo` reads `.interlock.json` into `Repo.config`; `parseRepoConfigOverride` validates it in `shared`, reporting every problem at once the way the global config does.
 - **Decided:** a malformed override refuses the repository rather than falling back to the defaults. The file decides which branches go unexamined, so ignoring it would have Interlock watch work the repository asked it to leave alone and say nothing about why — the failure shape this project rejects everywhere else.
 - **Decided:** an unrecognised key is a problem, not something to skip. A typo that quietly does nothing is indistinguishable from a setting that was never applied.
@@ -13,8 +20,6 @@ Short entries: done, decided, blocked. Newest first.
 - **Decided:** the file is opened once and measured through the handle, so the file that is sized is the file that is read. `isFile()` does what a size check cannot — measured `/dev/zero` at size 0 with a read that had not returned after three seconds, and a directory at size 288.
 - **Noted:** reading the file is not applying it. `listBranchRefs` still takes its own `ignoreBranches` option and nothing passes `Repo.config.ignoreBranches` to it, so ignore rules are stored and not yet honoured. Recorded against the watcher task, which is the caller that wires them.
 - **Noted for M3:** `toolchain` commands come from repository content. Validation here proves a non-empty string and nothing more; the sandbox is what makes running one acceptable.
-
-## 2026-08-24
 
 - **Fixed:** the `audit` job installed dependencies it never read. `pnpm audit` resolves advisories from `pnpm-lock.yaml` alone — verified by running it in a directory holding only the lockfile and manifest — so the install was the slowest step of the cheapest job.
 - **Fixed:** `bench` ran weekly only, which leaves a regression unattributed for up to seven days. It now also runs on pushes to `dev`. Not `main`, as suggested: `main` is release-only here, so a push trigger there would find the regression at release time instead of at the commit that caused it. Inert until benchmarks exist — `pnpm bench` prints budgets and writes nothing.

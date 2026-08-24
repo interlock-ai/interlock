@@ -1,6 +1,10 @@
 import { existsSync } from 'node:fs';
+import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
+
+const { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } = constants;
 import {
   InterlockError,
   isInterlockError,
@@ -198,44 +202,82 @@ export async function describeRepo(repo: UserRepo, options: DescribeOptions): Pr
  * unexamined, so falling back to the defaults would have Interlock watch work
  * the repository asked it to leave alone, and say nothing about why.
  *
- * Opened once and measured through the handle, so the file that is sized is the
- * file that is read. `isFile` rejects what a size check cannot: a directory, a
- * fifo, or a symlink to a character device, where the size reads as zero and
- * the read never ends.
+ * The path is repository content and every part of opening it is adversarial.
+ * `O_NONBLOCK` is what makes the rest reachable: opening a fifo without it
+ * blocks until a writer appears, so a `.interlock.json` created with `mkfifo`
+ * wedges discovery before any check runs. `O_NOFOLLOW` refuses a symlink
+ * outright — following one reads a file outside the repository, and the key
+ * names of whatever it finds come back in the error. `isFile` then rejects what
+ * remains: a directory, or a device whose size reads as zero.
+ *
+ * The read is bounded rather than trusted to `st_size`, which understates the
+ * readable length of a procfs file and reads as zero for every one of them.
  */
 async function readRepoConfig(rootPath: string): Promise<RepoConfigOverride> {
   const path = join(rootPath, REPO_CONFIG_FILENAME);
 
   let handle;
   try {
-    handle = await open(path, 'r');
+    handle = await open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
-    throw new InterlockError('CONFIG_INVALID', `Could not open ${REPO_CONFIG_FILENAME}`, {
-      details: { path },
-      remedy: `Make ${path} readable, or delete it to fall back to the global configuration.`,
-      infra: true,
-    });
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return {};
+    if (code === 'ELOOP') {
+      throw configProblem(path, `${REPO_CONFIG_FILENAME} must not be a symlink`);
+    }
+    throw configProblem(path, `${REPO_CONFIG_FILENAME} could not be opened`);
   }
 
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) {
-      throw new InterlockError('CONFIG_INVALID', `${REPO_CONFIG_FILENAME} is not a regular file`, {
-        details: { path },
-        remedy: `Replace ${path} with a JSON file, or delete it.`,
-      });
+      throw configProblem(path, `${REPO_CONFIG_FILENAME} is not a regular file`);
     }
-    if (stat.size > MAX_REPO_CONFIG_BYTES) {
-      throw new InterlockError('CONFIG_INVALID', `${REPO_CONFIG_FILENAME} is too large`, {
-        details: { path, size: stat.size, limit: MAX_REPO_CONFIG_BYTES },
-        remedy: `Keep ${path} under ${String(MAX_REPO_CONFIG_BYTES)} bytes.`,
-      });
-    }
-    return parseRepoConfigOverride(await handle.readFile('utf8'), path);
+    return parseRepoConfigOverride(await readCapped(handle, path), path);
   } finally {
-    await handle.close();
+    // A failure to close a read handle is not actionable, and letting it throw
+    // here would replace the diagnostic this function exists to produce.
+    await handle.close().catch(() => undefined);
   }
+}
+
+/**
+ * Read a file whose length is not known in advance.
+ *
+ * One byte past the ceiling is enough to know the file exceeds it, and reading
+ * in a loop is what makes the bound real: a single `read` may return short even
+ * when more is available.
+ */
+async function readCapped(handle: FileHandle, path: string): Promise<string> {
+  const buffer = Buffer.allocUnsafe(MAX_REPO_CONFIG_BYTES + 1);
+  let filled = 0;
+
+  while (filled < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, filled, buffer.length - filled, filled);
+    if (bytesRead === 0) break;
+    filled += bytesRead;
+  }
+
+  if (filled > MAX_REPO_CONFIG_BYTES) {
+    throw configProblem(
+      path,
+      `${REPO_CONFIG_FILENAME} is larger than ${String(MAX_REPO_CONFIG_BYTES)} bytes`,
+    );
+  }
+  return buffer.subarray(0, filled).toString('utf8');
+}
+
+/**
+ * A problem with the override file itself rather than with its contents.
+ *
+ * Not `infra`: an unreadable file inside a watched repository is repository
+ * state, and the infra flag is for a broken environment.
+ */
+function configProblem(path: string, message: string): InterlockError {
+  return new InterlockError('CONFIG_INVALID', message, {
+    details: { path },
+    remedy: `Replace ${path} with a readable JSON file, or delete it to fall back to the global configuration.`,
+  });
 }
 
 function shadowPathFor(id: RepoId, dataDir: string): string {

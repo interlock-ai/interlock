@@ -143,6 +143,10 @@ const TOOLCHAIN_KEYS = ['install', 'typecheck', 'build', 'test'] as const;
  * Problems name the key and the shape expected, never the value found. The file
  * may contain anything, and an `InterlockError` reaches the API and the agents.
  *
+ * Every problem is reported at once, with one exception `JSON.parse` decides:
+ * a repeated key keeps the last occurrence silently, so a file declaring
+ * `ignore` twice is read as valid.
+ *
  * @throws InterlockError `CONFIG_INVALID` listing every problem at once.
  */
 export function parseRepoConfigOverride(source: string, path: string): RepoConfigOverride {
@@ -230,17 +234,34 @@ function readToolchain(
     }
   }
 
-  const commands: Record<string, string> = {};
-  for (const key of TOOLCHAIN_KEYS) {
-    const command = source[key];
-    if (command === undefined) continue;
-    if (typeof command !== 'string' || command === '') {
-      problems.push(`toolchain.${key} must be a non-empty string`);
-      continue;
-    }
-    commands[key] = command;
+  const install = readCommand(source, 'install', problems);
+  const typecheck = readCommand(source, 'typecheck', problems);
+  const build = readCommand(source, 'build', problems);
+  const test = readCommand(source, 'test', problems);
+
+  const toolchain = {
+    ...(install === undefined ? {} : { install }),
+    ...(typecheck === undefined ? {} : { typecheck }),
+    ...(build === undefined ? {} : { build }),
+    ...(test === undefined ? {} : { test }),
+  };
+  // An empty object and an absent key mean the same thing; keeping both shapes
+  // leaves every reader to handle two spellings of nothing.
+  return Object.keys(toolchain).length === 0 ? undefined : toolchain;
+}
+
+function readCommand(
+  source: Record<string, unknown>,
+  key: (typeof TOOLCHAIN_KEYS)[number],
+  problems: string[],
+): string | undefined {
+  const command = source[key];
+  if (command === undefined) return undefined;
+  if (typeof command !== 'string' || command === '') {
+    problems.push(`toolchain.${key} must be a non-empty string`);
+    return undefined;
   }
-  return commands;
+  return command;
 }
 
 function repoConfigInvalid(problems: string[], path: string): InterlockError {

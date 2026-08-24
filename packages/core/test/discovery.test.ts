@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MAX_REPO_CONFIG_BYTES, ulid } from '@interlock/shared';
@@ -314,15 +314,6 @@ describe('repo discovery', () => {
       expect(error.remedy).toContain('.interlock.json');
     });
 
-    it('refuses a file larger than the ceiling', async () => {
-      writeFileSync(configPath(), JSON.stringify({ ignore: ['x'.repeat(MAX_REPO_CONFIG_BYTES)] }));
-
-      const error = await rejection(describeRepo(repo, options));
-
-      expect(error.code).toBe('CONFIG_INVALID');
-      expect(error.message).toContain('too large');
-    });
-
     it('refuses something that is not a regular file', async () => {
       // A size check cannot catch a directory, a fifo, or a symlink to a
       // character device whose size reads as zero and whose read never ends.
@@ -332,6 +323,52 @@ describe('repo discovery', () => {
 
       expect(error.code).toBe('CONFIG_INVALID');
       expect(error.message).toContain('not a regular file');
+    });
+
+    it('refuses a fifo instead of blocking on it', async () => {
+      // `open` on a fifo waits for a writer, so without O_NONBLOCK this never
+      // reaches a check — discovery stops rather than fails. The assertion is
+      // that it resolves at all; the vitest timeout is the real detector.
+      execFileSync('mkfifo', [configPath()], { stdio: 'pipe' });
+
+      const error = await rejection(describeRepo(repo, options));
+
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.message).toContain('not a regular file');
+    });
+
+    it('refuses a symlink rather than reading what it points at', async () => {
+      // Following one reads a file outside the repository, and the key names of
+      // whatever is found come back in the error as a structure oracle.
+      const outside = join(base, 'outside.json');
+      writeFileSync(outside, JSON.stringify({ auths: { registry: { auth: 'c2VjcmV0' } } }));
+      symlinkSync(outside, configPath());
+
+      const error = await rejection(describeRepo(repo, options));
+
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.message).toContain('must not be a symlink');
+      expect(JSON.stringify(error)).not.toContain('auths');
+    });
+
+    it('bounds the read rather than trusting the reported size', async () => {
+      // `st_size` understates procfs files and reads as zero for all of them,
+      // so the ceiling has to be enforced by how much is read.
+      writeFileSync(configPath(), 'x'.repeat(MAX_REPO_CONFIG_BYTES + 1));
+
+      const error = await rejection(describeRepo(repo, options));
+
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.message).toContain('larger than');
+    });
+
+    it('reads a file exactly at the ceiling', async () => {
+      // Padded with whitespace, not with a longer pattern: the ceiling bounds
+      // the file and a separate limit bounds each pattern.
+      const document = '{"ignore":["dist"]}';
+      writeFileSync(configPath(), document + ' '.repeat(MAX_REPO_CONFIG_BYTES - document.length));
+
+      expect((await describeRepo(repo, options)).config.ignore).toEqual(['dist']);
     });
 
     it('reads the file in the main worktree when opened through a linked one', async () => {

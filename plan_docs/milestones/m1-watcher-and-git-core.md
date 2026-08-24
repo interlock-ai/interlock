@@ -99,10 +99,10 @@ every task here and is not repeated per task.
   **Done when:** a repo with no file, a valid file and a malformed file each
   produce the right result, and the malformed one names what is wrong.
 
-  Reading the file into `Repo.config` is where this task ends. Nothing passes
-  `config.ignoreBranches` to `listBranchRefs` yet, which takes its own option —
-  so a repository's ignore rules are stored and not yet applied. The caller that
-  wires the two is the watcher.
+  Reading the file into `Repo.config` is where this task ends. Neither
+  `config.ignoreBranches` nor `config.ignore` is applied anywhere yet —
+  `listBranchRefs` takes its own option and the watcher does not exist — so a
+  repository's rules are stored and not yet honoured. The watcher wires both.
 
 - [ ] **Dirty-state snapshots**
       **Files:** `packages/core/src/git/worktree.ts`
@@ -199,9 +199,10 @@ every task here and is not repeated per task.
       **What:** filesystem events plus git ref changes, debounced, publishing
       `worktree.changed`.
 
-  Pass the repository's `config.ignoreBranches` into `listBranchRefs`. It is
-  read into `Repo.config` already and applied nowhere, so until this lands a
-  repository that asked for a branch to be left alone is watched anyway.
+  Apply the repository's own rules: `config.ignoreBranches` into
+  `listBranchRefs`, and `config.ignore` to the paths this watches. Both are read
+  into `Repo.config` already and applied nowhere, so until this lands a
+  repository that asked to be left alone is watched anyway.
 
   Ignore `.git/` internals except `refs/` and `HEAD`, and honour `.gitignore` —
   watching `node_modules` is the difference between 2% CPU and 100%. Debounce

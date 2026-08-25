@@ -762,7 +762,9 @@ const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 export function assertObjectId(oid: string, field: string): void {
   if (!OBJECT_ID.test(oid)) {
     throw new InterlockError('GIT_COMMAND_REFUSED', `${field} is not an object id`, {
-      details: { field, value: oid },
+      // Not the value: it arrives from a caller, may be anything, and this
+      // error reaches the API and the agents. The field name says enough.
+      details: { field },
       remedy: 'Pass an object id recorded by git, not a revision expression.',
     });
   }

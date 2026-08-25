@@ -30,12 +30,23 @@ import type { GitRunner, UserRepo } from './repo-handle.js';
  * while `false` removes rename pairing altogether. Naming the flag pins both,
  * the same way the runner pins `core.fsmonitor`.
  *
+ * `--inter-hunk-context` is the same argument in a different place: a
+ * repository setting `diff.interHunkContext` merges hunks that are near each
+ * other, so two separated edits are reported as one region. Zero is what
+ * `--unified=0` is already asking for and does not itself guarantee.
+ *
  * `--no-ext-diff` and `--no-textconv` are inert for the summary forms, which
  * git computes internally, and load-bearing for the patch, which otherwise runs
  * whatever program the repository's own config names. They live here so the
  * decision is in one place rather than at each call site.
  */
-const DIFF_BASE = ['diff', '--find-renames', '--no-ext-diff', '--no-textconv'] as const;
+const DIFF_BASE = [
+  'diff',
+  '--find-renames',
+  '--inter-hunk-context=0',
+  '--no-ext-diff',
+  '--no-textconv',
+] as const;
 
 export interface DiffOptions {
   readonly runner: GitRunner;
@@ -65,9 +76,7 @@ export async function extractChangeSet(
   mergeBaseSha: string,
   options: DiffOptions,
 ): Promise<ChangeSet> {
-  const target = options.snapshot?.treeOid ?? branch.headSha;
-  assertObjectId(mergeBaseSha, 'mergeBaseSha');
-  assertObjectId(target, options.snapshot === undefined ? 'headSha' : 'snapshot.treeOid');
+  const target = resolveTarget(branch, mergeBaseSha, options);
   const { runner } = options;
 
   const named = await readNameStatus(repo, runner, mergeBaseSha, target);
@@ -83,7 +92,7 @@ export async function extractChangeSet(
     path: entry.change.path,
     previousPath: entry.change.previousPath,
     kind: entry.change.kind,
-    hunks: entry.hunks,
+    hunks: [...entry.hunks],
     symbols: [],
     binary: binary.has(entry.change.path),
   }));
@@ -111,9 +120,7 @@ export async function touchedPaths(
   mergeBaseSha: string,
   options: DiffOptions,
 ): Promise<string[]> {
-  const target = options.snapshot?.treeOid ?? branch.headSha;
-  assertObjectId(mergeBaseSha, 'mergeBaseSha');
-  assertObjectId(target, options.snapshot === undefined ? 'headSha' : 'snapshot.treeOid');
+  const target = resolveTarget(branch, mergeBaseSha, options);
   const named = await readNameStatus(repo, options.runner, mergeBaseSha, target);
 
   const paths = new Set<string>();
@@ -122,6 +129,31 @@ export async function touchedPaths(
     if (entry.previousPath !== null) paths.add(entry.previousPath);
   }
   return [...paths];
+}
+
+/**
+ * What this diff compares against, once both ends are known to be object ids.
+ *
+ * Both entry points need the same two checks, and a revision is positional —
+ * `--` separates revisions from paths, not from flags, so a value shaped like
+ * `--output=<path>` in this position writes a file. One place to get it right,
+ * and one place to test.
+ */
+export function resolveTarget(
+  branch: BranchRef,
+  mergeBaseSha: string,
+  options: DiffOptions,
+): string {
+  const target = options.snapshot?.treeOid ?? branch.headSha;
+  assertObjectId(mergeBaseSha, 'mergeBaseSha');
+  assertObjectId(target, options.snapshot === undefined ? 'headSha' : 'snapshot.treeOid');
+  return target;
+}
+
+/** One reported file with the patch sections that belong to it. */
+export interface AlignedChange {
+  readonly change: NamedChange;
+  readonly hunks: readonly Hunk[];
 }
 
 /**
@@ -139,8 +171,8 @@ export async function touchedPaths(
 export function alignHunks(
   named: readonly NamedChange[],
   hunks: readonly Hunk[][],
-): { change: NamedChange; hunks: Hunk[] }[] {
-  const aligned: { change: NamedChange; hunks: Hunk[] }[] = [];
+): AlignedChange[] {
+  const aligned: AlignedChange[] = [];
   let section = 0;
 
   for (const change of named) {
@@ -156,6 +188,9 @@ export function alignHunks(
       {
         details: { summarySections: section, patchSections: hunks.length },
         remedy: 'Report this with the git version; the two forms are expected to agree.',
+        // A git whose output does not line up is the toolchain, not the
+        // repository being analysed, and never a property of the code.
+        infra: true,
       },
     );
   }
@@ -326,7 +361,7 @@ async function readHunks(
   base: string,
   target: string,
 ): Promise<Hunk[][]> {
-  const result = await runRequired(runner, repo, [...DIFF_BASE, '--unified=0', base, target]);
+  const result = await runRequired(runner, repo, [...DIFF_BASE, '--unified=0', base, target, '--']);
   return parseHunks(result.stdout);
 }
 

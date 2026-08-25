@@ -1,7 +1,15 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { ulid } from '@interlock/shared';
 import type { BranchRef, BranchRefId, Hunk, RepoId, SnapshotId } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -186,15 +194,18 @@ describe('extractChangeSet', () => {
     // wrong section unless both are consumed.
     writeFileSync(join(dir, 'aaa.txt'), 'a1\na2\n');
     writeFileSync(join(dir, 'becomes-link.txt'), 'plain\n');
-    writeFileSync(join(dir, 'zzz.txt'), 'z1\nz2\n');
+    writeFileSync(join(dir, 'zzz.txt'), 'z1\nz2\nz3\nz4\nz5\nz6\n');
     git('add', '-A');
     git('commit', '-qm', 'before the typechange');
     const from = git('rev-parse', 'HEAD').trim();
 
     writeFileSync(join(dir, 'aaa.txt'), 'a1\nA2\n');
     rmSync(join(dir, 'becomes-link.txt'));
-    symlinkSync('/tmp/target', join(dir, 'becomes-link.txt'));
-    writeFileSync(join(dir, 'zzz.txt'), 'Z1\nZ2\n');
+    symlinkSync('target-need-not-exist', join(dir, 'becomes-link.txt'));
+    // Two separated edits, so a file that inherited the typechange's second
+    // section would read one hunk instead of two. With one hunk each, every
+    // per-file assertion passes under the bug and only the total catches it.
+    writeFileSync(join(dir, 'zzz.txt'), 'Z1\nz2\nz3\nz4\nz5\nZ6\n');
     git('add', '-A');
     git('commit', '-qm', 'typechange');
     const head = git('rev-parse', 'HEAD').trim();
@@ -203,7 +214,7 @@ describe('extractChangeSet', () => {
     const byPath = new Map(changeSet.files.map((file) => [file.path, file]));
 
     expect(byPath.get('aaa.txt')?.hunks).toHaveLength(1);
-    expect(byPath.get('zzz.txt')?.hunks).toHaveLength(1);
+    expect(byPath.get('zzz.txt')?.hunks).toHaveLength(2);
     const total = changeSet.files.reduce((sum, file) => sum + file.hunks.length, 0);
     expect(total).toBe(
       git('diff', '--unified=0', '--find-renames', from, head)
@@ -212,23 +223,171 @@ describe('extractChangeSet', () => {
     );
   });
 
-  it.each([
-    ['an absolute revision expression', 'HEAD~1'],
-    ['a flag-shaped value', '--output=/tmp/interlock-should-not-write.txt'],
-  ])('refuses %s as a revision', async (_name, value) => {
+  it('refuses a revision expression, which git would resolve', async () => {
+    const head = commitEveryShape();
+
+    await expect(extractChangeSet(repo, branch(head), 'HEAD~1', { runner })).rejects.toThrow(
+      'not an object id',
+    );
+  });
+
+  it('refuses a flag-shaped revision, which git would act on', async () => {
     // Revisions are positional, and `--` separates them from paths rather than
-    // from flags, so a flag-shaped one is acted on.
+    // from flags — so this writes a file where it is not refused.
+    const marker = join(dir, '..', `${basename(dir)}-written-by-git.txt`);
     const head = commitEveryShape();
 
     await expect(
       extractChangeSet(repo, branch(head), base, {
         runner,
-        snapshot: { id: ulid<SnapshotId>(), treeOid: value },
+        snapshot: { id: ulid<SnapshotId>(), treeOid: `--output=${marker}` },
       }),
     ).rejects.toThrow('not an object id');
-    await expect(extractChangeSet(repo, branch(head), value, { runner })).rejects.toThrow(
+    // The throw is not the point; the file is.
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it.each([
+    ['a space', 'has space.txt'],
+    ['a newline', 'has\nnewline.txt'],
+    ['a quote', 'has"quote.txt'],
+  ])('survives a path containing %s', async (_name, path) => {
+    // Patch output quotes these, which is why hunks are matched to files by
+    // position rather than by reading the path back out of the patch.
+    writeFileSync(join(dir, path), 'first\n');
+    git('add', '-A');
+    git('commit', '-qm', 'awkward');
+    const head = git('rev-parse', 'HEAD').trim();
+
+    const changeSet = await extractChangeSet(repo, branch(head), base, { runner });
+
+    expect(changeSet.files.map((file) => file.path)).toContain(path);
+    expect(changeSet.files.map((file) => file.path).sort()).toEqual([...gitPaths(head)].sort());
+  });
+
+  it('leaves symbols empty rather than guessing them', async () => {
+    const head = commitEveryShape();
+
+    const changeSet = await extractChangeSet(repo, branch(head), base, { runner });
+
+    expect(changeSet.files.every((file) => file.symbols.length === 0)).toBe(true);
+  });
+
+  it('keeps rename pairing when the repository turns it off', async () => {
+    const head = commitEveryShape();
+    const before = await extractChangeSet(repo, branch(head), base, { runner });
+
+    git('config', 'diff.renames', 'false');
+    const after = await extractChangeSet(repo, branch(head), base, { runner });
+
+    expect(after.files.map((file) => `${file.kind} ${file.path}`)).toEqual(
+      before.files.map((file) => `${file.kind} ${file.path}`),
+    );
+    expect(after.files.some((file) => file.kind === 'renamed')).toBe(true);
+  });
+
+  it('suppresses the copy detection a repository asks for', () => {
+    // Asserted on what git emitted rather than on the parsed result: a copy is
+    // normalised to an addition with no previous path, byte-identical to the
+    // addition the flag produces, so comparing change sets cannot tell them
+    // apart and would pass however the flag behaved.
+    writeFileSync(join(dir, 'copy-source.txt'), 'copy me\n');
+    git('add', '-A');
+    git('commit', '-qm', 'source');
+    const from = git('rev-parse', 'HEAD').trim();
+    writeFileSync(join(dir, 'copy-of.txt'), 'copy me\n');
+    writeFileSync(join(dir, 'copy-source.txt'), 'copy me\nand more\n');
+    git('add', '-A');
+    git('commit', '-qm', 'copied');
+    const head = git('rev-parse', 'HEAD').trim();
+    git('config', 'diff.renames', 'copies');
+
+    const unflagged = git('diff', '--name-status', '-z', from, head);
+    const ours = git('diff', '--name-status', '-z', '--find-renames', from, head);
+
+    // The fixture has to provoke a copy, or neither side proves anything.
+    expect(unflagged).toContain('C');
+    expect(ours).not.toContain('C');
+  });
+
+  it('keeps the hunk count a repository config would merge away', async () => {
+    // `diff.interHunkContext` merges hunks that sit near each other, so two
+    // separated edits are reported as one region. Same family as
+    // `diff.renames`: repository config deciding what Interlock records.
+    writeFileSync(join(dir, 'spread.txt'), 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n');
+    git('add', '-A');
+    git('commit', '-qm', 'spread');
+    const from = git('rev-parse', 'HEAD').trim();
+    writeFileSync(join(dir, 'spread.txt'), 'X1\nl2\nl3\nl4\nl5\nl6\nl7\nX8\n');
+    git('add', '-A');
+    git('commit', '-qm', 'both ends');
+    const head = git('rev-parse', 'HEAD').trim();
+    git('config', 'diff.interHunkContext', '10');
+
+    const changeSet = await extractChangeSet(repo, branch(head), from, { runner });
+
+    // A fixed expectation, because git invoked without the pinning flags moves
+    // with the config and would agree with a broken answer.
+    expect(changeSet.files.find((file) => file.path === 'spread.txt')?.hunks).toHaveLength(2);
+  });
+
+  it('keeps hunks with their own files across a typechange', async () => {
+    // git reports a file becoming a symlink once in the summaries and twice in
+    // the patch — a deletion and a creation — so every later file takes the
+    // wrong section unless both are consumed.
+    writeFileSync(join(dir, 'aaa.txt'), 'a1\na2\n');
+    writeFileSync(join(dir, 'becomes-link.txt'), 'plain\n');
+    writeFileSync(join(dir, 'zzz.txt'), 'z1\nz2\nz3\nz4\nz5\nz6\n');
+    git('add', '-A');
+    git('commit', '-qm', 'before the typechange');
+    const from = git('rev-parse', 'HEAD').trim();
+
+    writeFileSync(join(dir, 'aaa.txt'), 'a1\nA2\n');
+    rmSync(join(dir, 'becomes-link.txt'));
+    symlinkSync('target-need-not-exist', join(dir, 'becomes-link.txt'));
+    // Two separated edits, so a file that inherited the typechange's second
+    // section would read one hunk instead of two. With one hunk each, every
+    // per-file assertion passes under the bug and only the total catches it.
+    writeFileSync(join(dir, 'zzz.txt'), 'Z1\nz2\nz3\nz4\nz5\nZ6\n');
+    git('add', '-A');
+    git('commit', '-qm', 'typechange');
+    const head = git('rev-parse', 'HEAD').trim();
+
+    const changeSet = await extractChangeSet(repo, branch(head), from, { runner });
+    const byPath = new Map(changeSet.files.map((file) => [file.path, file]));
+
+    expect(byPath.get('aaa.txt')?.hunks).toHaveLength(1);
+    expect(byPath.get('zzz.txt')?.hunks).toHaveLength(2);
+    const total = changeSet.files.reduce((sum, file) => sum + file.hunks.length, 0);
+    expect(total).toBe(
+      git('diff', '--unified=0', '--find-renames', from, head)
+        .split('\n')
+        .filter((line) => line.startsWith('@@ ')).length,
+    );
+  });
+
+  it('refuses a revision expression, which git would resolve', async () => {
+    const head = commitEveryShape();
+
+    await expect(extractChangeSet(repo, branch(head), 'HEAD~1', { runner })).rejects.toThrow(
       'not an object id',
     );
+  });
+
+  it('refuses a flag-shaped revision, which git would act on', async () => {
+    // Revisions are positional, and `--` separates them from paths rather than
+    // from flags — so this writes a file where it is not refused.
+    const marker = join(dir, '..', `${basename(dir)}-written-by-git.txt`);
+    const head = commitEveryShape();
+
+    await expect(
+      extractChangeSet(repo, branch(head), base, {
+        runner,
+        snapshot: { id: ulid<SnapshotId>(), treeOid: `--output=${marker}` },
+      }),
+    ).rejects.toThrow('not an object id');
+    // The throw is not the point; the file is.
+    expect(existsSync(marker)).toBe(false);
   });
 
   it.each([

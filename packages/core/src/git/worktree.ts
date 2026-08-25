@@ -26,7 +26,8 @@ import { parseStatus } from './status.js';
  *
  * It counts the paths alone. The runner's own arguments and the inherited
  * environment share the same budget, which is why the figure sits well under
- * any real limit rather than at it.
+ * any real limit rather than at it — on POSIX. Windows caps a command line near
+ * 32 KB, so a port revisits this number rather than discovering it.
  */
 const MAX_PATHSPEC_BYTES = 96 * 1024;
 
@@ -104,12 +105,13 @@ export async function captureDirtyState(
   const scope = options.scope ?? { kind: 'whole-tree' };
 
   const headTree = await resolveTree(worktree, runner, 'HEAD^{tree}');
-  const capturedAt = new Date().toISOString();
+  // Stamped when the tree is written rather than when the capture began: it
+  // describes what was read, and reading takes time a watcher may care about.
   const describe = (treeOid: string, takenAs: SnapshotScope['kind']): WorktreeSnapshot => ({
     treeOid,
     clean: headTree !== null && treeOid === headTree,
     takenAs,
-    capturedAt,
+    capturedAt: new Date().toISOString(),
   });
 
   if (scope.kind === 'scoped') {
@@ -161,6 +163,11 @@ async function resolveTree(
  * add that is ignored, and fails outright on one matching nothing — a file
  * created and deleted inside a debounce window. Both are ordinary watcher
  * output, and `status` reports neither.
+ *
+ * It closes the window rather than eliminating it: a file deleted between this
+ * answer and the staging that follows is reported and then gone. The next
+ * watcher event captures the deletion, so the cost is one failed capture rather
+ * than a wrong tree.
  */
 async function changedPaths(
   worktree: UserRepo,
@@ -178,8 +185,16 @@ async function changedPaths(
       { indexFile },
     );
     for (const entry of parseStatus(status.stdout)) {
-      reported.add(entry.path);
-      if (entry.origPath !== null) reported.add(entry.origPath);
+      // The worktree column alone. The index column compares the seeded index
+      // against HEAD, which says how the base tree already differs from the
+      // last commit — a path deleted in an earlier batch reports `D` there
+      // forever, and restaging it finds nothing on disk and nothing in the
+      // index, which `git add` treats as fatal.
+      //
+      // A rename's source needs no special handling for the same reason: git
+      // reports it as a deletion in this column and its destination as
+      // untracked, so both arrive on their own account.
+      if (entry.worktree !== ' ') reported.add(entry.path);
     }
   }
 

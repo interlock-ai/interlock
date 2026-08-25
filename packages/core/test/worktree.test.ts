@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createGitRunner } from '../src/git/repo-handle.js';
 import type { GitResult, GitRunner, UserRepo } from '../src/git/repo-handle.js';
@@ -64,6 +64,7 @@ describe('captureDirtyState', () => {
 
   const indexBytes = (): string => readFileSync(join(dir, '.git', 'index')).toString('base64');
   const indexMtime = (): number => statSync(join(dir, '.git', 'index')).mtimeMs;
+  const gitDirEntries = (): string[] => readdirSync(join(dir, '.git')).sort();
 
   /**
    * Snapshot the user's repository, run a capture, and assert nothing moved.
@@ -76,11 +77,16 @@ describe('captureDirtyState', () => {
     const before = observable();
     const bytes = indexBytes();
     const mtime = indexMtime();
+    // Listed after `observable()` for the same reason the index is: the user's
+    // own git writes while it reads, and with `core.splitIndex` set that status
+    // call leaves a `sharedindex.*` behind that this would blame on the capture.
+    const entries = gitDirEntries();
 
     const result = await capture();
 
     expect(indexBytes()).toBe(bytes);
     expect(indexMtime()).toBe(mtime);
+    expect(gitDirEntries()).toEqual(entries);
     expect(observable()).toEqual(before);
     return result;
   };
@@ -360,6 +366,52 @@ describe('captureDirtyState', () => {
       expect(error.infra).toBe(false);
     });
 
+    it('survives a path being reported again after its change was absorbed', async () => {
+      // Status against the seeded index reports two columns. The index one
+      // compares that index against HEAD, so a deletion already recorded in the
+      // base tree keeps reporting `D` forever — and restaging it finds nothing
+      // on disk and nothing in the index, which `git add` treats as fatal.
+      rmSync(join(dir, 'tracked.txt'));
+      const first = await captureDirtyState(dir, repo, {
+        runner,
+        scope: {
+          kind: 'scoped',
+          paths: ['tracked.txt'],
+          baseTreeOid: git('rev-parse', 'HEAD^{tree}').trim(),
+        },
+      });
+
+      const second = await leavingUserStateIntact(() =>
+        captureDirtyState(dir, repo, {
+          runner,
+          scope: { kind: 'scoped', paths: ['tracked.txt'], baseTreeOid: first.treeOid },
+        }),
+      );
+
+      expect(second.treeOid).toBe(first.treeOid);
+      expect(treePaths(second.treeOid)).not.toContain('tracked.txt');
+    });
+
+    it('treats a reported path as a literal name, not a pathspec expression', async () => {
+      // A leading `:` makes git read the argument as magic: `:(exclude)a.txt`
+      // would drop the file from the capture and report success.
+      writeFileSync(join(dir, 'tracked.txt'), 'edited\n');
+      const base = git('rev-parse', 'HEAD^{tree}').trim();
+
+      const snapshot = await leavingUserStateIntact(() =>
+        captureDirtyState(dir, repo, {
+          runner,
+          scope: {
+            kind: 'scoped',
+            paths: [':(exclude)tracked.txt', 'tracked.txt'],
+            baseTreeOid: base,
+          },
+        }),
+      );
+
+      expect(git('show', `${snapshot.treeOid}:tracked.txt`)).toBe('edited\n');
+    });
+
     it('falls back to a whole-tree capture when the base tree has been collected', async () => {
       // A user running `git gc --prune=now` can collect a tree Interlock holds,
       // because nothing references it. That is a reason to re-read, not to fail.
@@ -426,6 +478,50 @@ describe('captureDirtyState', () => {
       expect(error.code).toBe('GIT_COMMAND_REFUSED');
       expect(error.message).toContain('not an object id');
       expect(error.infra).toBe(false);
+    });
+  });
+
+  describe('against a repository configured to write while it reads', () => {
+    it.each([
+      ['core.splitIndex', 'true'],
+      ['core.fsmonitor', 'true'],
+      ['core.untrackedCache', 'true'],
+    ])('leaves the git directory alone with %s set', async (key, value) => {
+      // Repository-local config is the layer the runner's environment scrubbing
+      // cannot reach. The split index in particular puts a `sharedindex.*` file
+      // in `$GIT_DIR` on every index write, whatever `GIT_INDEX_FILE` says —
+      // and the user most likely to have it on is the one with the big
+      // repository this is built for.
+      git('config', key, value);
+      writeFileSync(join(dir, 'tracked.txt'), 'modified\n');
+
+      const snapshot = await leavingUserStateIntact(() => captureDirtyState(dir, repo, { runner }));
+
+      // The wrapper asserts the git directory; this asserts the capture still
+      // did its job rather than failing quietly into an unchanged tree.
+      expect(git('show', `${snapshot.treeOid}:tracked.txt`)).toBe('modified\n');
+    });
+  });
+
+  describe('a linked worktree', () => {
+    it('captures the worktree it was given, not the main checkout', async () => {
+      // `worktreePath` and `repo` differ here, which is the reason they are
+      // separate arguments, and a branch checked out in a linked worktree is
+      // the ordinary case rather than an exotic one.
+      const linked = join(dir, '..', `${basename(dir)}-wt`);
+      git('branch', 'side');
+      git('worktree', 'add', '-q', linked, 'side');
+      writeFileSync(join(linked, 'only-here.txt'), 'linked\n');
+
+      try {
+        const snapshot = await leavingUserStateIntact(() =>
+          captureDirtyState(realpathSync(linked), repo, { runner }),
+        );
+
+        expect(treePaths(snapshot.treeOid)).toContain('only-here.txt');
+      } finally {
+        rmSync(linked, { recursive: true, force: true });
+      }
     });
   });
 

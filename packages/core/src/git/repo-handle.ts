@@ -388,6 +388,11 @@ function buildEnv(indexFile: string | undefined): NodeJS.ProcessEnv {
 
   // Fail instead of blocking on a credential prompt that has no terminal.
   env.GIT_TERMINAL_PROMPT = '0';
+  // Paths reaching git here are file paths, never pathspec expressions. Without
+  // this a leading `:` turns one into magic — `:(exclude)src` silently drops a
+  // file from a snapshot, and a file genuinely named `:(top)x` can never be
+  // named at all.
+  env.GIT_LITERAL_PATHSPECS = '1';
   // Read commands must never take `index.lock`, or they stall the user's own git.
   env.GIT_OPTIONAL_LOCKS = '0';
   // Neutralises *global and system* config only. Repository-local `.git/config`
@@ -583,6 +588,11 @@ export function createGitRunner(options: GitRunnerOptions = {}): GitRunner {
         '--no-pager',
         '-c',
         'core.fsmonitor=',
+        '-c',
+        // A repository that enables the split index makes every index write
+        // leave a `sharedindex.*` file in `$GIT_DIR` — the user's, whatever
+        // `GIT_INDEX_FILE` says. Redirecting the index does not move it.
+        'core.splitIndex=false',
         '-c',
         `core.hooksPath=${devNull}`,
         ...args,

@@ -139,14 +139,21 @@ every task here and is not repeated per task.
     matching `.gitignore`, which a rebuild from the worktree alone would drop.
 
   Filter the reported paths through `status --porcelain -z` **against the seeded
-  index**, not the user's. Against the user's index the question is "is this
+  index**, reading only the **worktree column**. The index column compares that
+  index against `HEAD`, so a change already absorbed into the base tree keeps
+  reporting forever — a deleted file reports `D` there in every later batch, and
+  restaging it finds nothing on disk and nothing in the index, which `git add`
+  treats as fatal. Not the user's index either. Against the user's index the question is "is this
   path dirty relative to HEAD", and a file the user reverted answers no — so the
   capture keeps a base tree still holding the edit, wrong rather than stale, the
   same failure the seed was fixed to avoid. Seed first, then filter.
   `git add` refuses a path it is told to add that is ignored, and fails outright
   on one matching nothing — a file created and deleted inside a debounce window.
   Both are ordinary watcher output and both would fail the capture; `status`
-  reports neither. Both halves of a rename have to be reported, because a
+  reports neither. Repository config is the layer environment scrubbing cannot
+  reach, and `core.splitIndex` puts a `sharedindex.*` file in the user's
+  `$GIT_DIR` on every index write whatever `GIT_INDEX_FILE` says — so a fixture
+  setting it is part of proving the repository was left alone. Both halves of a rename have to be reported, because a
   pathspec narrows git's rename detection too. Paths are worktree-relative, and
   one that escapes is refused by name rather than filtered away or left to fail
   as an error about git.
@@ -175,13 +182,18 @@ every task here and is not repeated per task.
   writes the user's index, Interlock has corrupted work in progress that was
   never committed and cannot be recovered.
 
-- [ ] **ChangeSet extraction**
+- [x] **ChangeSet extraction**
       **Files:** `packages/core/src/git/diff.ts`
       **What:** `extractChangeSet`, `touchedPaths` — normalised diff against the
       merge-base.
 
   Parse `diff --numstat -z` and `diff --name-status -z` with NUL separation, not
-  newlines, so paths containing spaces or newlines survive. Both forms are
+  newlines, so paths containing spaces or newlines survive. `--name-status`
+  reports a rename **source first**, the reverse of `status --porcelain -z`.
+  Pass `--find-renames` explicitly: rename detection is configurable per
+  repository, and `diff.renames = copies` makes git emit copy pairs where an
+  addition belongs while `false` removes pairing altogether — a watched
+  repository must not decide the shape of what Interlock records. Both forms are
   computed internally, so neither runs a repository's `diff.external` or
   `textconv` driver. Any diff that produces a **patch** does, and repository
   config is the layer the runner's environment scrubbing cannot reach — a
@@ -191,7 +203,12 @@ every task here and is not repeated per task.
 
   **Done when:** a fixture with a renamed file, a binary file, a mode change and
   a path containing a space produces the same file list as `git diff` for the
-  same range, and the hunk counts match.
+  same range, and the hunk counts match — per file and in total, since hunks
+  attributed to the wrong file still agree file by file when one gains what
+  another loses. Compare against git rather than against literals. Name both
+  paths of a rename when asking git for one file's hunks: a pathspec narrows
+  rename detection, so scoped to the destination git counts a hunk for content
+  that never changed.
 
 - [ ] **SQLite store**
       **Files:** `packages/daemon/src/store/`

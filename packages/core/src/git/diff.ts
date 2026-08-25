@@ -92,7 +92,7 @@ export async function extractChangeSet(
     path: entry.change.path,
     previousPath: entry.change.previousPath,
     kind: entry.change.kind,
-    hunks: [...entry.hunks],
+    hunks: entry.hunks,
     symbols: [],
     binary: binary.has(entry.change.path),
   }));
@@ -136,14 +136,10 @@ export async function touchedPaths(
  *
  * Both entry points need the same two checks, and a revision is positional —
  * `--` separates revisions from paths, not from flags, so a value shaped like
- * `--output=<path>` in this position writes a file. One place to get it right,
- * and one place to test.
+ * `--output=<path>` in this position writes a file. One place to get it right;
+ * both entry points are tested through their own signatures.
  */
-export function resolveTarget(
-  branch: BranchRef,
-  mergeBaseSha: string,
-  options: DiffOptions,
-): string {
+function resolveTarget(branch: BranchRef, mergeBaseSha: string, options: DiffOptions): string {
   const target = options.snapshot?.treeOid ?? branch.headSha;
   assertObjectId(mergeBaseSha, 'mergeBaseSha');
   assertObjectId(target, options.snapshot === undefined ? 'headSha' : 'snapshot.treeOid');

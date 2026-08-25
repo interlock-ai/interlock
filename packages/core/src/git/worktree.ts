@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { notImplemented } from '@interlock/shared';
+import { isAbsolute, join, normalize, sep } from 'node:path';
+import { InterlockError, notImplemented } from '@interlock/shared';
 import { runRequired } from './repo-handle.js';
 import type { GitRunner, ShadowRepo, UserRepo } from './repo-handle.js';
 import { parseStatus } from './status.js';
@@ -23,8 +23,15 @@ import { parseStatus } from './status.js';
  * that reports thousands of paths would exceed it. The runner closes stdin, so
  * a long list is split across invocations against the same temporary index
  * rather than piped.
+ *
+ * It counts the paths alone. The runner's own arguments and the inherited
+ * environment share the same budget, which is why the figure sits well under
+ * any real limit rather than at it.
  */
 const MAX_PATHSPEC_BYTES = 96 * 1024;
+
+/** Object ids as git writes them: hex, and long enough to be one. */
+const OBJECT_ID = /^[0-9a-f]{40,64}$/u;
 
 /**
  * What a capture is allowed to look at.
@@ -110,17 +117,15 @@ export async function captureDirtyState(
     // running `git gc --prune=now` between snapshots can collect the tree this
     // capture means to extend. Losing the base is a reason to take a full
     // snapshot, not a reason to fail.
+    assertObjectId(scope.baseTreeOid);
+    assertInsideWorktree(scope.paths);
     const base = await resolveTree(worktree, runner, `${scope.baseTreeOid}^{tree}`);
     if (base !== null) {
-      const changed = await changedPaths(worktree, runner, scope.paths);
-      // Nothing the watcher reported turned out to be a change git records, so
-      // the tree it already has still describes the worktree.
-      if (changed.length === 0) return describe(base, 'scoped');
-      return describe(await buildTree(worktree, runner, base, changed), 'scoped');
+      return describe(await extendTree(worktree, runner, base, scope.paths), 'scoped');
     }
   }
 
-  return describe(await buildTree(worktree, runner, headTree, null), 'whole-tree');
+  return describe(await buildTree(worktree, runner, headTree), 'whole-tree');
 }
 
 /**
@@ -142,30 +147,36 @@ async function resolveTree(
 }
 
 /**
- * Narrow the watcher's reported paths to the ones git would record.
+ * Which of the reported paths differ from the tree being extended.
  *
- * `git add` refuses an explicitly named path that is ignored, and fails outright
- * on one that matches nothing — a file created and deleted inside a debounce
- * window. Both are ordinary watcher output, and both would fail the capture.
- * `status` reports neither, so asking it first is what makes the scoped path
- * usable rather than merely fast.
+ * Asked against `indexFile` rather than the user's index, which is what makes
+ * the answer the right one. Against the user's index the question is "is this
+ * path dirty relative to HEAD", and a file the user reverted answers no — so a
+ * capture would hand back a base tree still holding the edit, which is a tree
+ * that is wrong rather than merely stale. Against an index seeded from the base
+ * tree the question is "does this path differ from what I already recorded",
+ * which is the one the scoped path has.
+ *
+ * The filter earns its place twice over: `git add` refuses a path it is told to
+ * add that is ignored, and fails outright on one matching nothing — a file
+ * created and deleted inside a debounce window. Both are ordinary watcher
+ * output, and `status` reports neither.
  */
 async function changedPaths(
   worktree: UserRepo,
   runner: GitRunner,
+  indexFile: string,
   paths: readonly string[],
 ): Promise<string[]> {
   const reported = new Set<string>();
 
   for (const chunk of chunkPaths(paths)) {
-    const status = await runRequired(runner, worktree, [
-      'status',
-      '--porcelain',
-      '-z',
-      '--untracked-files=all',
-      '--',
-      ...chunk,
-    ]);
+    const status = await runRequired(
+      runner,
+      worktree,
+      ['status', '--porcelain', '-z', '--untracked-files=all', '--', ...chunk],
+      { indexFile },
+    );
     for (const entry of parseStatus(status.stdout)) {
       reported.add(entry.path);
       if (entry.origPath !== null) reported.add(entry.origPath);
@@ -173,6 +184,71 @@ async function changedPaths(
   }
 
   return [...reported];
+}
+
+/**
+ * A base tree comes back from storage, and a revision is interpolated into a
+ * `rev-parse` argument. Checking its shape keeps a value that drifted — or
+ * arrived flag-shaped — from being handed to git as one.
+ */
+function assertObjectId(oid: string): void {
+  if (!OBJECT_ID.test(oid)) {
+    throw new InterlockError('GIT_COMMAND_REFUSED', 'Base tree is not an object id', {
+      details: { baseTreeOid: oid },
+      remedy: 'Pass the tree recorded by a previous snapshot.',
+    });
+  }
+}
+
+/**
+ * Paths are relative to the worktree, and a path that escapes it is a caller
+ * bug rather than something to work around.
+ *
+ * Filtering one out silently would leave a snapshot quietly missing whatever
+ * the caller meant by it; passing it through fails the capture with an error
+ * about git. Neither says what actually went wrong.
+ */
+function assertInsideWorktree(paths: readonly string[]): void {
+  for (const path of paths) {
+    const normalised = normalize(path);
+    if (isAbsolute(normalised) || normalised === '..' || normalised.startsWith(`..${sep}`)) {
+      throw new InterlockError(
+        'GIT_COMMAND_REFUSED',
+        'Snapshot paths are relative to the worktree, and this one leaves it',
+        {
+          details: { path },
+          remedy: 'Report paths relative to the worktree root.',
+        },
+      );
+    }
+  }
+}
+
+/**
+ * Extend a tree with whatever changed among the reported paths.
+ *
+ * The index is seeded before the paths are filtered, because the seeded index
+ * is the thing the filter has to compare against.
+ */
+async function extendTree(
+  worktree: UserRepo,
+  runner: GitRunner,
+  baseTree: string,
+  paths: readonly string[],
+): Promise<string> {
+  return withTemporaryIndex(async (indexFile) => {
+    await runRequired(runner, worktree, ['read-tree', baseTree], { indexFile });
+
+    const changed = await changedPaths(worktree, runner, indexFile, paths);
+    // Nothing reported differs from the tree already recorded, so that tree
+    // still describes the worktree and there is nothing to write.
+    if (changed.length === 0) return baseTree;
+
+    for (const chunk of chunkPaths(changed)) {
+      await runRequired(runner, worktree, ['add', '-A', '--', ...chunk], { indexFile });
+    }
+    return writeTree(worktree, runner, indexFile);
+  });
 }
 
 /**
@@ -188,35 +264,43 @@ async function buildTree(
   worktree: UserRepo,
   runner: GitRunner,
   seedTree: string | null,
-  paths: readonly string[] | null,
 ): Promise<string> {
-  // Outside the repository, and in a directory that exists: the runner resolves
-  // the path through `realpath` and refuses one it cannot verify.
-  const directory = await mkdtemp(join(tmpdir(), 'interlock-index-'));
-  const indexFile = join(directory, 'index');
-
-  try {
+  return withTemporaryIndex(async (indexFile) => {
     await runRequired(
       runner,
       worktree,
       seedTree === null ? ['read-tree', '--empty'] : ['read-tree', seedTree],
       { indexFile },
     );
+    await runRequired(runner, worktree, ['add', '-A'], { indexFile });
+    return writeTree(worktree, runner, indexFile);
+  });
+}
 
-    if (paths === null) {
-      await runRequired(runner, worktree, ['add', '-A'], { indexFile });
-    } else {
-      for (const chunk of chunkPaths(paths)) {
-        await runRequired(runner, worktree, ['add', '-A', '--', ...chunk], { indexFile });
-      }
-    }
+async function writeTree(
+  worktree: UserRepo,
+  runner: GitRunner,
+  indexFile: string,
+): Promise<string> {
+  const tree = await runRequired(runner, worktree, ['write-tree'], { indexFile });
+  return tree.stdout.trim();
+}
 
-    const tree = await runRequired(runner, worktree, ['write-tree'], { indexFile });
-    return tree.stdout.trim();
+/**
+ * Run something against an index that exists only for the duration.
+ *
+ * The directory is created first so the file has an existing parent: the runner
+ * resolves the path through `realpath` and refuses one it cannot verify.
+ */
+async function withTemporaryIndex<T>(use: (indexFile: string) => Promise<T>): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), 'interlock-index-'));
+  try {
+    return await use(join(directory, 'index'));
   } finally {
     // The error path too: a temporary index left behind is a file in the user's
-    // temp directory that nothing will ever clean up.
-    await rm(directory, { recursive: true, force: true });
+    // temp directory that nothing will ever clean up. A failure to remove it is
+    // not worth replacing the diagnostic that brought us here.
+    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
@@ -246,7 +330,7 @@ function* chunkPaths(paths: readonly string[]): Generator<string[]> {
 export function commitSnapshotInShadow(
   _shadow: ShadowRepo,
   _snapshotTreeSha: string,
-  _options: SnapshotOptions,
+  _options: { readonly runner: GitRunner },
 ): Promise<string> {
   return notImplemented('commitSnapshotInShadow');
 }

@@ -423,8 +423,14 @@ function gitFailed(
  * avoid the user's index, and pointing it back at `.git/index` would write the
  * very file the whole design protects.
  */
-function indexRedirectionProblem(repo: UserRepo, indexFile: string | undefined): string | null {
-  if (indexFile === undefined) return 'it writes the index, and no indexFile was given';
+function indexRedirectionProblem(
+  repo: UserRepo,
+  kind: CommandKind,
+  indexFile: string | undefined,
+): string | null {
+  if (indexFile === undefined) {
+    return kind === 'index-only' ? 'it writes the index, and no indexFile was given' : null;
+  }
   if (!isAbsolute(indexFile)) return 'indexFile must be an absolute path';
 
   const target = realTargetOf(indexFile);
@@ -532,8 +538,12 @@ export function createGitRunner(options: GitRunnerOptions = {}): GitRunner {
         );
       }
 
-      if (repo.kind === 'user' && kind === 'index-only') {
-        const rejection = indexRedirectionProblem(repo, runOptions.indexFile);
+      // Whenever a redirection is present, not only for the class that writes
+      // one. A read-only verb carrying `indexFile` would otherwise skip the
+      // check entirely, and `status` against a redirected index is how a
+      // snapshot asks what changed relative to the tree it is extending.
+      if (repo.kind === 'user' && (kind === 'index-only' || runOptions.indexFile !== undefined)) {
+        const rejection = indexRedirectionProblem(repo, kind, runOptions.indexFile);
         if (rejection !== null) {
           return Promise.reject(
             new InterlockError(

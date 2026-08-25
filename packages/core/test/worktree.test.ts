@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createGitRunner } from '../src/git/repo-handle.js';
 import type { GitResult, GitRunner, UserRepo } from '../src/git/repo-handle.js';
 import { captureDirtyState } from '../src/git/worktree.js';
+import { rejection } from './support/rejection.js';
 
 /**
  * Snapshotting a worktree someone is working in.
@@ -262,6 +263,65 @@ describe('captureDirtyState', () => {
       expect(paths).toContain('renamed.txt');
       // Restaged too, or the tree keeps a file that is no longer there.
       expect(paths).not.toContain('tracked.txt');
+    });
+
+    it.each([
+      [
+        'a file the user reverted',
+        (): void => {
+          writeFileSync(join(dir, 'tracked.txt'), 'committed\n');
+        },
+      ],
+      [
+        'a staged new file that was unstaged and deleted',
+        (): void => {
+          git('rm', '--cached', '-q', 'added.txt');
+          rmSync(join(dir, 'added.txt'));
+        },
+      ],
+    ])('sees %s, which the user index reports as no change', async (_name, undo) => {
+      // Asked against the user's index these answer "clean", because they are —
+      // relative to HEAD. Relative to the tree being extended they are changes,
+      // and a capture that misses them hands back content the worktree does not
+      // have.
+      writeFileSync(join(dir, 'tracked.txt'), 'EDITED\n');
+      writeFileSync(join(dir, 'added.txt'), 'x\n');
+      git('add', 'added.txt');
+      const base = await captureDirtyState(dir, repo, { runner });
+
+      undo();
+      const paths = ['tracked.txt', 'added.txt'];
+      const scoped = await leavingUserStateIntact(() =>
+        captureDirtyState(dir, repo, {
+          runner,
+          scope: { kind: 'scoped', paths, baseTreeOid: base.treeOid },
+        }),
+      );
+      const whole = await captureDirtyState(dir, repo, { runner });
+
+      // The property that matters: scoped and whole-tree describe one worktree.
+      expect(scoped.treeOid).toBe(whole.treeOid);
+      expect(scoped.clean).toBe(whole.clean);
+      expect(scoped.treeOid).not.toBe(base.treeOid);
+    });
+
+    it.each([
+      ['an absolute path', '/etc/hosts'],
+      ['a path climbing out of the worktree', '../escape.txt'],
+    ])('refuses %s rather than failing the capture with a git error', async (_name, path) => {
+      const base = await captureDirtyState(dir, repo, { runner });
+
+      const error = await rejection(
+        captureDirtyState(dir, repo, {
+          runner,
+          scope: { kind: 'scoped', paths: [path], baseTreeOid: base.treeOid },
+        }),
+      );
+
+      expect(error.code).toBe('GIT_COMMAND_REFUSED');
+      expect(error.message).toContain('relative to the worktree');
+      expect(error.details.path).toBe(path);
+      expect(error.infra).toBe(false);
     });
 
     it('falls back to a whole-tree capture when the base tree has been collected', async () => {

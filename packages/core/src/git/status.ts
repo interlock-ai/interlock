@@ -36,10 +36,15 @@ export function isUntracked(entry: StatusEntry): boolean {
  * splitting on one is the classic way to corrupt a file list.
  *
  * A rename or copy occupies two fields — the destination, then the source — so
- * the source is attached to its entry rather than read as the next one. Either
- * column may report it: git has only ever emitted the pair for the index
- * column, but consuming on both costs nothing and the asymmetry would be a
- * silent off-by-one if that changed.
+ * the source is attached to its entry rather than read as the next one.
+ *
+ * Both columns are consumed, though only the index column is verifiable against
+ * current git: porcelain v1 reports a worktree rename as a deletion and an
+ * untracked file, with `status.renames` set or not. The worktree branch is
+ * therefore untested and untestable here, and it assumes a git that reports
+ * `R` in that column would also emit the source field. One that reported `R`
+ * alone would make this consume the next entry — the off-by-one it guards
+ * against, inverted — so it is defence, not coverage.
  */
 export function parseStatus(stdout: string): StatusEntry[] {
   const entries: StatusEntry[] = [];

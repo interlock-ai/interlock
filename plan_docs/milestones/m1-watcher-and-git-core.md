@@ -138,12 +138,18 @@ every task here and is not repeated per task.
     rather than an empty index also keeps a file that is tracked despite
     matching `.gitignore`, which a rebuild from the worktree alone would drop.
 
-  Filter the reported paths through `status --porcelain -z` before staging them.
+  Filter the reported paths through `status --porcelain -z` **against the seeded
+  index**, not the user's. Against the user's index the question is "is this
+  path dirty relative to HEAD", and a file the user reverted answers no — so the
+  capture keeps a base tree still holding the edit, wrong rather than stale, the
+  same failure the seed was fixed to avoid. Seed first, then filter.
   `git add` refuses a path it is told to add that is ignored, and fails outright
   on one matching nothing — a file created and deleted inside a debounce window.
   Both are ordinary watcher output and both would fail the capture; `status`
   reports neither. Both halves of a rename have to be reported, because a
-  pathspec narrows git's rename detection too.
+  pathspec narrows git's rename detection too. Paths are worktree-relative, and
+  one that escapes is refused by name rather than filtered away or left to fail
+  as an error about git.
 
   Objects written this way are unreferenced until something points at them, so a
   user running `git gc --prune=now` can collect a tree Interlock is still holding.
@@ -156,6 +162,10 @@ every task here and is not repeated per task.
 --porcelain`, the index mtime and `.git/index` contents are byte-identical to
   before. A second test kills the operation between `add` and `write-tree` and
   asserts the same.
+
+  Assert too that a scoped capture and a whole-tree capture of the same worktree
+  produce the same tree. User-state integrity says nothing about whether the
+  tree is right, and that is the half a scoped capture can get wrong.
 
   Read the index with `fs` and before running any git command in the assertion:
   `git status` rewrites `.git/index` to refresh its stat cache, leaving the

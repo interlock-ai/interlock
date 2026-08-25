@@ -142,8 +142,10 @@ const TOOLCHAIN_KEYS = ['install', 'typecheck', 'build', 'test'] as const;
  * that quietly does nothing is indistinguishable from a setting that was never
  * applied.
  *
- * Problems name the key and the shape expected, never the value found. The file
- * may contain anything, and an `InterlockError` reaches the API and the agents.
+ * Problems name a known key and the shape expected, and carry nothing the file
+ * chose — not a value, and not the name of a key that is not in the schema. A
+ * key is written by whoever writes the repository exactly as a value is, and an
+ * `InterlockError` reaches the API and the agents.
  *
  * Every problem is reported at once, with one exception `JSON.parse` decides:
  * a repeated key keeps the last occurrence silently, so a file declaring
@@ -167,11 +169,7 @@ export function parseRepoConfigOverride(source: string, path: string): RepoConfi
   }
 
   const record = parsed as Record<string, unknown>;
-  for (const key of Object.keys(record)) {
-    if (!(REPO_CONFIG_KEYS as readonly string[]).includes(key)) {
-      problems.push(`unknown key: ${key}`);
-    }
-  }
+  reportUnknownKeys(record, REPO_CONFIG_KEYS, 'the file', problems);
 
   const ignore = readPatternList(record, 'ignore', problems);
   const ignoreBranches = readPatternList(record, 'ignoreBranches', problems);
@@ -184,6 +182,33 @@ export function parseRepoConfigOverride(source: string, path: string): RepoConfi
     ...(ignoreBranches === undefined ? {} : { ignoreBranches }),
     ...(toolchain === undefined ? {} : { toolchain }),
   };
+}
+
+/**
+ * Report keys outside the schema by counting them, never by naming them.
+ *
+ * A key is chosen by whoever writes the repository, so it is file content in
+ * the same sense a value is — and this error reaches the API and the agents.
+ * Naming the set that is accepted says everything a reader needs to fix the
+ * file while carrying nothing back out of it.
+ *
+ * Counting rather than listing is also what bounds the error. One key is as
+ * long as the file allows and there may be thousands of them, so echoing them
+ * produced an error larger than the file that caused it.
+ */
+function reportUnknownKeys(
+  record: Record<string, unknown>,
+  allowed: readonly string[],
+  scope: string,
+  problems: string[],
+): void {
+  const unknown = Object.keys(record).filter((key) => !allowed.includes(key)).length;
+  if (unknown === 0) return;
+
+  problems.push(
+    `${scope} has ${String(unknown)} unknown ${unknown === 1 ? 'key' : 'keys'}; ` +
+      `expected only ${allowed.join(', ')}`,
+  );
 }
 
 function readPatternList(
@@ -232,11 +257,7 @@ function readToolchain(
   }
 
   const source = value as Record<string, unknown>;
-  for (const key of Object.keys(source)) {
-    if (!(TOOLCHAIN_KEYS as readonly string[]).includes(key)) {
-      problems.push(`unknown key: toolchain.${key}`);
-    }
-  }
+  reportUnknownKeys(source, TOOLCHAIN_KEYS, 'toolchain', problems);
 
   const install = readCommand(source, 'install', problems);
   const typecheck = readCommand(source, 'typecheck', problems);

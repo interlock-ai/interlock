@@ -170,23 +170,38 @@ describe('parseRepoConfigOverride', () => {
 
   it('refuses a key it does not recognise', () => {
     // A typo that is quietly ignored is indistinguishable from a setting that
-    // was never applied.
+    // was never applied, so the count and the accepted set are both reported.
     expect(problemsFrom(JSON.stringify({ ignoreBranch: ['x'] }))).toContain(
-      'unknown key: ignoreBranch',
+      'the file has 1 unknown key; expected only ignore, ignoreBranches, toolchain',
     );
     expect(problemsFrom(JSON.stringify({ toolchain: { lint: 'x' } }))).toContain(
-      'unknown key: toolchain.lint',
+      'toolchain has 1 unknown key; expected only install, typecheck, build, test',
     );
   });
 
-  it('names the key and the shape, never the value', () => {
-    // The file is repository content and the error reaches agents, so a secret
-    // pasted into it must not travel with the complaint.
-    const problems = problemsFrom(
-      JSON.stringify({ ignoreBranches: ['ok', 'sk-secret-token', 42] }),
-    );
-    expect(problems).toContain('ignoreBranches[2] must be a string');
-    expect(problems.join('; ')).not.toContain('sk-secret-token');
+  it.each([
+    ['a value', { ignoreBranches: ['ok', 'sk-secret-token', 42] }],
+    ['a key', { 'sk-secret-token': 1 }],
+    ['a key inside toolchain', { toolchain: { 'sk-secret-token': 'x' } }],
+  ])('names the shape expected, never %s the file chose', (_name, value) => {
+    // The file is repository content and the error reaches agents, so nothing
+    // written into it travels back out with the complaint. A key is chosen the
+    // same way a value is: `{"<injected text>": 1}` is a valid JSON object.
+    expect(problemsFrom(JSON.stringify(value)).join('; ')).not.toContain('sk-secret-token');
+  });
+
+  it('keeps the complaint smaller than the file that caused it', () => {
+    // Echoing each unknown key produced an error twice the size of a file full
+    // of them, and one key may be as long as the file allows.
+    const many = Object.fromEntries(Array.from({ length: 4_000 }, (_, i) => [`k${String(i)}`, 1]));
+    const oneEnormous = { ['A'.repeat(60_000)]: 1 };
+
+    for (const value of [many, oneEnormous]) {
+      const source = JSON.stringify(value);
+      const problems = problemsFrom(source);
+      expect(problems).toHaveLength(1);
+      expect(problems.join('; ').length).toBeLessThan(source.length);
+    }
   });
 
   it.each([

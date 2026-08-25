@@ -747,3 +747,23 @@ export async function runRequired(
   }
   return result;
 }
+
+/** Object ids as git writes them: SHA-1 or SHA-256 length, and nothing between. */
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+
+/**
+ * Refuse anything that is not an object id before git is asked to resolve it.
+ *
+ * Revisions are positional arguments, and `--` separates them from paths rather
+ * than from flags — so a value that drifted, or arrived shaped like
+ * `--output=<path>`, is read as a flag and acted on. These come back from
+ * storage, which makes their shape an assumption rather than a guarantee.
+ */
+export function assertObjectId(oid: string, field: string): void {
+  if (!OBJECT_ID.test(oid)) {
+    throw new InterlockError('GIT_COMMAND_REFUSED', `${field} is not an object id`, {
+      details: { field, value: oid },
+      remedy: 'Pass an object id recorded by git, not a revision expression.',
+    });
+  }
+}

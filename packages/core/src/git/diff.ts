@@ -1,4 +1,4 @@
-import { ulid } from '@interlock/shared';
+import { InterlockError, ulid } from '@interlock/shared';
 import type {
   BranchRef,
   ChangeKind,
@@ -8,7 +8,7 @@ import type {
   Hunk,
   SnapshotId,
 } from '@interlock/shared';
-import { runRequired } from './repo-handle.js';
+import { assertObjectId, runRequired } from './repo-handle.js';
 import type { GitRunner, UserRepo } from './repo-handle.js';
 
 /**
@@ -66,6 +66,8 @@ export async function extractChangeSet(
   options: DiffOptions,
 ): Promise<ChangeSet> {
   const target = options.snapshot?.treeOid ?? branch.headSha;
+  assertObjectId(mergeBaseSha, 'mergeBaseSha');
+  assertObjectId(target, options.snapshot === undefined ? 'headSha' : 'snapshot.treeOid');
   const { runner } = options;
 
   const named = await readNameStatus(repo, runner, mergeBaseSha, target);
@@ -77,13 +79,13 @@ export async function extractChangeSet(
     readHunks(repo, runner, mergeBaseSha, target),
   ]);
 
-  const files: FileChange[] = named.map((entry, index) => ({
-    path: entry.path,
-    previousPath: entry.previousPath,
-    kind: entry.kind,
-    hunks: hunks[index] ?? [],
+  const files: FileChange[] = alignHunks(named, hunks).map((entry) => ({
+    path: entry.change.path,
+    previousPath: entry.change.previousPath,
+    kind: entry.change.kind,
+    hunks: entry.hunks,
     symbols: [],
-    binary: binary.has(entry.path),
+    binary: binary.has(entry.change.path),
   }));
 
   return {
@@ -110,6 +112,8 @@ export async function touchedPaths(
   options: DiffOptions,
 ): Promise<string[]> {
   const target = options.snapshot?.treeOid ?? branch.headSha;
+  assertObjectId(mergeBaseSha, 'mergeBaseSha');
+  assertObjectId(target, options.snapshot === undefined ? 'headSha' : 'snapshot.treeOid');
   const named = await readNameStatus(repo, options.runner, mergeBaseSha, target);
 
   const paths = new Set<string>();
@@ -120,10 +124,54 @@ export async function touchedPaths(
   return [...paths];
 }
 
-interface NamedChange {
+/**
+ * Give each reported file the patch sections that belong to it.
+ *
+ * A typechange — a file becoming a symlink, or the reverse — is one entry in
+ * the summaries and two sections in the patch, a deletion and a creation.
+ * Consuming both keeps every later file aligned with its own hunks.
+ *
+ * A count that does not come out even is raised rather than absorbed. The
+ * alignment is an assumption about git and has been wrong once already, and a
+ * hunk attributed to the wrong file is evidence pointing at the wrong branch —
+ * worse than no evidence, because it reads as certainty.
+ */
+export function alignHunks(
+  named: readonly NamedChange[],
+  hunks: readonly Hunk[][],
+): { change: NamedChange; hunks: Hunk[] }[] {
+  const aligned: { change: NamedChange; hunks: Hunk[] }[] = [];
+  let section = 0;
+
+  for (const change of named) {
+    const sections = change.status === 'T' ? 2 : 1;
+    aligned.push({ change, hunks: hunks.slice(section, section + sections).flat() });
+    section += sections;
+  }
+
+  if (section !== hunks.length) {
+    throw new InterlockError(
+      'GIT_COMMAND_FAILED',
+      'git reported a different number of files in the summary and the patch',
+      {
+        details: { summarySections: section, patchSections: hunks.length },
+        remedy: 'Report this with the git version; the two forms are expected to agree.',
+      },
+    );
+  }
+  return aligned;
+}
+
+export interface NamedChange {
   readonly kind: ChangeKind;
   readonly path: string;
   readonly previousPath: string | null;
+  /**
+   * The letter git reported, kept because the mapping to {@link ChangeKind}
+   * loses a distinction the patch depends on: a typechange is one entry here
+   * and two sections there.
+   */
+  readonly status: string;
 }
 
 async function readNameStatus(
@@ -138,6 +186,7 @@ async function readNameStatus(
     '-z',
     base,
     target,
+    '--',
   ]);
   return parseNameStatus(result.stdout);
 }
@@ -170,13 +219,14 @@ export function parseNameStatus(stdout: string): NamedChange[] {
         kind: letter === 'R' ? 'renamed' : 'added',
         path: destination,
         previousPath: letter === 'R' ? source : null,
+        status: letter,
       });
       continue;
     }
 
     const path = fields[++i];
     if (path === undefined) break;
-    changes.push({ kind: kindOf(letter), path, previousPath: null });
+    changes.push({ kind: kindOf(letter), path, previousPath: null, status: letter });
   }
 
   return changes;
@@ -214,7 +264,14 @@ async function readBinaryPaths(
   base: string,
   target: string,
 ): Promise<Set<string>> {
-  const result = await runRequired(runner, repo, [...DIFF_BASE, '--numstat', '-z', base, target]);
+  const result = await runRequired(runner, repo, [
+    ...DIFF_BASE,
+    '--numstat',
+    '-z',
+    base,
+    target,
+    '--',
+  ]);
   return parseBinaryPaths(result.stdout);
 }
 
@@ -232,8 +289,14 @@ export function parseBinaryPaths(stdout: string): Set<string> {
     const field = fields[i];
     if (field === undefined || field === '') continue;
 
-    const [added, deleted, path] = field.split('\t');
-    const isBinary = added === '-' && deleted === '-';
+    // Split on the first two tabs only: the third column is the path, and a
+    // path may contain a tab of its own — `-z` does not quote it away.
+    const firstTab = field.indexOf('\t');
+    const secondTab = field.indexOf('\t', firstTab + 1);
+    if (firstTab === -1 || secondTab === -1) continue;
+    const isBinary =
+      field.slice(0, firstTab) === '-' && field.slice(firstTab + 1, secondTab) === '-';
+    const path = field.slice(secondTab + 1);
 
     if (path === '') {
       // A rename: the source and destination follow, and the destination is

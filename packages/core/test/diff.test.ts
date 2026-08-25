@@ -1,17 +1,19 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ulid } from '@interlock/shared';
-import type { BranchRef, BranchRefId, RepoId, SnapshotId } from '@interlock/shared';
+import type { BranchRef, BranchRefId, Hunk, RepoId, SnapshotId } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  alignHunks,
   extractChangeSet,
   parseBinaryPaths,
   parseHunks,
   parseNameStatus,
   touchedPaths,
 } from '../src/git/diff.js';
+import type { NamedChange } from '../src/git/diff.js';
 import { createGitRunner } from '../src/git/repo-handle.js';
 import type { UserRepo } from '../src/git/repo-handle.js';
 import { captureDirtyState } from '../src/git/worktree.js';
@@ -178,6 +180,57 @@ describe('extractChangeSet', () => {
     expect(mode?.binary).toBe(false);
   });
 
+  it('keeps hunks with their own files across a typechange', async () => {
+    // git reports a file becoming a symlink once in the summaries and twice in
+    // the patch — a deletion and a creation — so every later file takes the
+    // wrong section unless both are consumed.
+    writeFileSync(join(dir, 'aaa.txt'), 'a1\na2\n');
+    writeFileSync(join(dir, 'becomes-link.txt'), 'plain\n');
+    writeFileSync(join(dir, 'zzz.txt'), 'z1\nz2\n');
+    git('add', '-A');
+    git('commit', '-qm', 'before the typechange');
+    const from = git('rev-parse', 'HEAD').trim();
+
+    writeFileSync(join(dir, 'aaa.txt'), 'a1\nA2\n');
+    rmSync(join(dir, 'becomes-link.txt'));
+    symlinkSync('/tmp/target', join(dir, 'becomes-link.txt'));
+    writeFileSync(join(dir, 'zzz.txt'), 'Z1\nZ2\n');
+    git('add', '-A');
+    git('commit', '-qm', 'typechange');
+    const head = git('rev-parse', 'HEAD').trim();
+
+    const changeSet = await extractChangeSet(repo, branch(head), from, { runner });
+    const byPath = new Map(changeSet.files.map((file) => [file.path, file]));
+
+    expect(byPath.get('aaa.txt')?.hunks).toHaveLength(1);
+    expect(byPath.get('zzz.txt')?.hunks).toHaveLength(1);
+    const total = changeSet.files.reduce((sum, file) => sum + file.hunks.length, 0);
+    expect(total).toBe(
+      git('diff', '--unified=0', '--find-renames', from, head)
+        .split('\n')
+        .filter((line) => line.startsWith('@@ ')).length,
+    );
+  });
+
+  it.each([
+    ['an absolute revision expression', 'HEAD~1'],
+    ['a flag-shaped value', '--output=/tmp/interlock-should-not-write.txt'],
+  ])('refuses %s as a revision', async (_name, value) => {
+    // Revisions are positional, and `--` separates them from paths rather than
+    // from flags, so a flag-shaped one is acted on.
+    const head = commitEveryShape();
+
+    await expect(
+      extractChangeSet(repo, branch(head), base, {
+        runner,
+        snapshot: { id: ulid<SnapshotId>(), treeOid: value },
+      }),
+    ).rejects.toThrow('not an object id');
+    await expect(extractChangeSet(repo, branch(head), value, { runner })).rejects.toThrow(
+      'not an object id',
+    );
+  });
+
   it.each([
     ['a space', 'has space.txt'],
     ['a newline', 'has\nnewline.txt'],
@@ -317,14 +370,14 @@ describe('parseNameStatus', () => {
   it('reads a rename as source then destination', () => {
     // The reverse of `status --porcelain -z`, which puts the destination first.
     expect(parseNameStatus(nul('R100', 'from.txt', 'to.txt', ''))).toEqual([
-      { kind: 'renamed', path: 'to.txt', previousPath: 'from.txt' },
+      { kind: 'renamed', path: 'to.txt', previousPath: 'from.txt', status: 'R' },
     ]);
   });
 
   it('reads a copy as an addition, leaving its source alone', () => {
     // A copy's source still exists, and `previousPath` means the opposite.
     expect(parseNameStatus(nul('C75', 'source.txt', 'copy.txt', ''))).toEqual([
-      { kind: 'added', path: 'copy.txt', previousPath: null },
+      { kind: 'added', path: 'copy.txt', previousPath: null, status: 'C' },
     ]);
   });
 
@@ -338,7 +391,7 @@ describe('parseNameStatus', () => {
     // An unrecognised letter still names a path that differs, and dropping it
     // would understate what a branch touches.
     expect(parseNameStatus(nul(letter, 'file.txt', ''))).toEqual([
-      { kind, path: 'file.txt', previousPath: null },
+      { kind, path: 'file.txt', previousPath: null, status: letter },
     ]);
   });
 
@@ -357,9 +410,57 @@ describe('parseBinaryPaths', () => {
     ]);
   });
 
+  it('keeps a path containing a tab, the separator this format uses', () => {
+    // `-z` does not quote the path, so splitting on every tab truncates it —
+    // the real file loses its binary flag and a phantom takes its place.
+    expect([...parseBinaryPaths(['-\t-\thas\ttab.bin', ''].join('\0'))]).toEqual(['has\ttab.bin']);
+  });
+
   it('separates binary from text by the counts, not the path', () => {
     const stdout = ['-\t-\timage.png', '3\t1\tcode.ts', ''].join('\0');
 
     expect([...parseBinaryPaths(stdout)]).toEqual(['image.png']);
+  });
+});
+
+describe('alignHunks', () => {
+  const change = (path: string, status: string): NamedChange => ({
+    kind: 'modified',
+    path,
+    previousPath: null,
+    status,
+  });
+  const hunk = (line: number): Hunk => ({
+    oldStart: line,
+    oldLines: 1,
+    newStart: line,
+    newLines: 1,
+  });
+
+  it('gives a typechange both of its sections', () => {
+    const aligned = alignHunks(
+      [change('before.txt', 'M'), change('link.txt', 'T'), change('after.txt', 'M')],
+      [[hunk(1)], [hunk(2)], [hunk(3)], [hunk(4)]],
+    );
+
+    expect(aligned.map((entry) => entry.hunks)).toEqual([
+      [hunk(1)],
+      [hunk(2), hunk(3)],
+      // The file after the typechange keeps its own section rather than
+      // inheriting the second half of the one before it.
+      [hunk(4)],
+    ]);
+  });
+
+  it('raises when the two forms disagree rather than absorbing it', () => {
+    // Reachable only from a git that splits a section this does not know about.
+    // Silently absorbing it would attribute hunks to whichever file sits at
+    // that index, which reads as evidence.
+    expect(() => alignHunks([change('one.txt', 'M')], [[hunk(1)], [hunk(2)]])).toThrow(
+      'different number of files',
+    );
+    expect(() => alignHunks([change('one.txt', 'M'), change('two.txt', 'M')], [[hunk(1)]])).toThrow(
+      'different number of files',
+    );
   });
 });

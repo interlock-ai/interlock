@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -28,6 +29,20 @@ describe('captureDirtyState', () => {
   let dir: string;
   let repo: UserRepo;
   const runner = createGitRunner();
+
+  /** Wraps the real runner and records the subcommand of each invocation. */
+  const recording = (): { runner: GitRunner; verbs: string[] } => {
+    const verbs: string[] = [];
+    return {
+      verbs,
+      runner: {
+        run: (target, args, options): Promise<GitResult> => {
+          verbs.push(args[0] ?? '');
+          return runner.run(target, args, options);
+        },
+      },
+    };
+  };
 
   const git = (...args: string[]): string =>
     execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe', encoding: 'utf8' });
@@ -279,18 +294,41 @@ describe('captureDirtyState', () => {
           rmSync(join(dir, 'added.txt'));
         },
       ],
-    ])('sees %s, which the user index reports as no change', async (_name, undo) => {
-      // Asked against the user's index these answer "clean", because they are —
-      // relative to HEAD. Relative to the tree being extended they are changes,
-      // and a capture that misses them hands back content the worktree does not
-      // have.
+      [
+        'a further edit',
+        (): void => {
+          writeFileSync(join(dir, 'tracked.txt'), 'EDITED AGAIN\n');
+        },
+      ],
+      [
+        'a deletion',
+        (): void => {
+          rmSync(join(dir, 'tracked.txt'));
+        },
+      ],
+      [
+        'a new untracked file',
+        (): void => {
+          writeFileSync(join(dir, 'appeared.txt'), 'new\n');
+        },
+      ],
+      [
+        'a mode change',
+        (): void => {
+          chmodSync(join(dir, 'tracked.txt'), 0o755);
+        },
+      ],
+    ])('describes the same worktree as a whole-tree capture after %s', async (_name, change) => {
+      // The strongest invariant this function has: two routes to one worktree
+      // must agree. Asserting agreement rather than a literal tree is what
+      // keeps it from drifting into whatever the implementation happens to do.
       writeFileSync(join(dir, 'tracked.txt'), 'EDITED\n');
       writeFileSync(join(dir, 'added.txt'), 'x\n');
       git('add', 'added.txt');
       const base = await captureDirtyState(dir, repo, { runner });
 
-      undo();
-      const paths = ['tracked.txt', 'added.txt'];
+      change();
+      const paths = ['tracked.txt', 'added.txt', 'appeared.txt'];
       const scoped = await leavingUserStateIntact(() =>
         captureDirtyState(dir, repo, {
           runner,
@@ -299,10 +337,8 @@ describe('captureDirtyState', () => {
       );
       const whole = await captureDirtyState(dir, repo, { runner });
 
-      // The property that matters: scoped and whole-tree describe one worktree.
       expect(scoped.treeOid).toBe(whole.treeOid);
       expect(scoped.clean).toBe(whole.clean);
-      expect(scoped.treeOid).not.toBe(base.treeOid);
     });
 
     it.each([
@@ -342,15 +378,23 @@ describe('captureDirtyState', () => {
 
     it('splits a path list too long for one command line', async () => {
       // Arguments and environment share a fixed budget, and the runner closes
-      // stdin, so a long list has to be split across invocations.
+      // stdin, so a long list has to be split across invocations. Names are
+      // long rather than numerous so the ceiling is crossed with fewer files:
+      // it is the byte total that decides, not the count.
+      const filler = 'n'.repeat(100);
       const many = Array.from(
-        { length: 4_000 },
-        (_, i) => `file-${String(i).padStart(5, '0')}.txt`,
+        { length: 1_000 },
+        (_, i) => `${filler}-${String(i).padStart(4, '0')}.txt`,
       );
+      const budget = many.reduce((total, path) => total + Buffer.byteLength(path) + 1, 0);
+      expect(budget).toBeGreaterThan(96 * 1024);
+
       for (const path of many) writeFileSync(join(dir, path), `${path}\n`);
+      const { runner: counting, verbs } = recording();
+
       const snapshot = await leavingUserStateIntact(() =>
         captureDirtyState(dir, repo, {
-          runner,
+          runner: counting,
           scope: {
             kind: 'scoped',
             paths: many,
@@ -359,7 +403,29 @@ describe('captureDirtyState', () => {
         }),
       );
 
+      // The point of the test: one `add` would have exceeded the budget.
+      expect(verbs.filter((verb) => verb === 'add').length).toBeGreaterThan(1);
       expect(treePaths(snapshot.treeOid)).toHaveLength(many.length + 2);
+    });
+
+    it.each([
+      ['an object id that is too short', 'abc123'],
+      ['an object id that is not hex', 'z'.repeat(40)],
+      ['a value shaped like a flag', '--output=/tmp/pwned'],
+      ['a revision expression', 'HEAD~1'],
+    ])('refuses %s as a base tree', async (_name, baseTreeOid) => {
+      // It arrives from stored state and is interpolated into a `rev-parse`
+      // argument, so its shape is checked before git ever sees it.
+      const error = await rejection(
+        captureDirtyState(dir, repo, {
+          runner,
+          scope: { kind: 'scoped', paths: ['tracked.txt'], baseTreeOid },
+        }),
+      );
+
+      expect(error.code).toBe('GIT_COMMAND_REFUSED');
+      expect(error.message).toContain('not an object id');
+      expect(error.infra).toBe(false);
     });
   });
 
@@ -378,6 +444,22 @@ describe('captureDirtyState', () => {
       await leavingUserStateIntact(async () => {
         await expect(
           captureDirtyState(dir, repo, { runner: failingAt('write-tree') }),
+        ).rejects.toThrow('injected failure');
+      });
+    });
+
+    it('leaves the user repository untouched when a scoped capture fails mid-stage', async () => {
+      // The scoped route runs read-tree, status, add and write-tree, so a
+      // failure inside `add` leaves a partly populated temporary index behind.
+      writeFileSync(join(dir, 'tracked.txt'), 'modified\n');
+      const base = git('rev-parse', 'HEAD^{tree}').trim();
+
+      await leavingUserStateIntact(async () => {
+        await expect(
+          captureDirtyState(dir, repo, {
+            runner: failingAt('add'),
+            scope: { kind: 'scoped', paths: ['tracked.txt'], baseTreeOid: base },
+          }),
         ).rejects.toThrow('injected failure');
       });
     });

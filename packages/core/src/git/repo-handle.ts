@@ -752,6 +752,28 @@ export async function runRequired(
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 
 /**
+ * Refuse a revision git would read as an option.
+ *
+ * Weaker than {@link assertObjectId} and for the callers that need it: a ref
+ * name is not an object id, so only the shapes git parses as something other
+ * than a revision can be excluded. `--` does not help — it separates revisions
+ * from paths, not from flags, and a flag-shaped value sits before it. Left
+ * through, `--is-ancestor` turns `merge-base` into an exit-code test that
+ * prints nothing, which reads back as "no common ancestor" and drops a pair
+ * from analysis without saying so.
+ */
+export function assertRevision(revision: string, field: string): void {
+  if (revision === '' || revision.startsWith('-')) {
+    throw new InterlockError('GIT_COMMAND_REFUSED', `${field} is not a revision`, {
+      // Not the value: it comes from a caller and this error reaches the API
+      // and the agents. The field name says which argument was wrong.
+      details: { field },
+      remedy: 'Pass a ref name or an object id, not an option.',
+    });
+  }
+}
+
+/**
  * Refuse anything that is not an object id before git is asked to resolve it.
  *
  * Revisions are positional arguments, and `--` separates them from paths rather

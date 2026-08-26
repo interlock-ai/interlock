@@ -385,6 +385,15 @@ export function* chunkPaths(paths: readonly string[]): Generator<string[]> {
 /**
  * Materialise a snapshot as a commit **in the shadow repo only**, so the
  * speculative merge has two real commits to work with.
+ *
+ * Where the object-lifetime problem gets settled. A capture writes its tree
+ * into the user's object database, where nothing references it, so `git gc
+ * --prune=now` can collect it between the capture and the merge that needs it.
+ * The base-tree fallback covers the next capture and not this: by then the
+ * objects are simply gone. Transferring them into the shadow promptly is what
+ * removes the window, and a missing object at merge time is retryable — take
+ * the snapshot again — rather than an infrastructure failure, which is a
+ * constraint on how the store records one.
  */
 export function commitSnapshotInShadow(
   _shadow: ShadowRepo,

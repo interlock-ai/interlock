@@ -1,6 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
+  existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -14,7 +16,7 @@ import { basename, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createGitRunner } from '../src/git/repo-handle.js';
 import type { GitResult, GitRunner, UserRepo } from '../src/git/repo-handle.js';
-import { captureDirtyState } from '../src/git/worktree.js';
+import { captureDirtyState, chunkPaths, MAX_PATHSPEC_BYTES } from '../src/git/worktree.js';
 import { rejection } from './support/rejection.js';
 
 /**
@@ -62,8 +64,9 @@ describe('captureDirtyState', () => {
     config: readFileSync(join(dir, '.git', 'config'), 'utf8'),
   });
 
-  const indexBytes = (): string => readFileSync(join(dir, '.git', 'index')).toString('base64');
-  const indexMtime = (): number => statSync(join(dir, '.git', 'index')).mtimeMs;
+  const indexPath = (): string => join(dir, '.git', 'index');
+  const indexBytes = (path = indexPath()): string => readFileSync(path).toString('base64');
+  const indexMtime = (path = indexPath()): number => statSync(path).mtimeMs;
   const gitDirEntries = (): string[] => readdirSync(join(dir, '.git')).sort();
 
   /**
@@ -226,8 +229,7 @@ describe('captureDirtyState', () => {
       ['a path that is ignored', 'ignored.txt'],
       ['a path that no longer exists and never was tracked', 'vanished.txt'],
     ])('survives %s being reported', async (_name, path) => {
-      // `git add` refuses the first and fails outright on the second, and both
-      // are ordinary watcher output.
+      // Both are ordinary watcher output that `git add` refuses.
       writeFileSync(join(dir, 'ignored.txt'), 'secret\n');
       const base = await captureDirtyState(dir, repo, { runner });
       writeFileSync(join(dir, 'real.txt'), 'real\n');
@@ -348,6 +350,26 @@ describe('captureDirtyState', () => {
     });
 
     it.each([
+      ['an empty path', ''],
+      ['a path naming the worktree root', '.'],
+      ['a path naming the root the long way', 'sub/..'],
+    ])('refuses %s, which would widen the capture to everything', async (_name, path) => {
+      // git reads all three as the worktree root, so a scoped capture would
+      // quietly become a whole-tree one and report itself as scoped.
+      const base = await captureDirtyState(dir, repo, { runner });
+
+      const error = await rejection(
+        captureDirtyState(dir, repo, {
+          runner,
+          scope: { kind: 'scoped', paths: [path], baseTreeOid: base.treeOid },
+        }),
+      );
+
+      expect(error.code).toBe('GIT_COMMAND_REFUSED');
+      expect(error.infra).toBe(false);
+    });
+
+    it.each([
       ['an absolute path', '/etc/hosts'],
       ['a path climbing out of the worktree', '../escape.txt'],
     ])('refuses %s rather than failing the capture with a git error', async (_name, path) => {
@@ -367,10 +389,8 @@ describe('captureDirtyState', () => {
     });
 
     it('survives a path being reported again after its change was absorbed', async () => {
-      // Status against the seeded index reports two columns. The index one
-      // compares that index against HEAD, so a deletion already recorded in the
-      // base tree keeps reporting `D` forever — and restaging it finds nothing
-      // on disk and nothing in the index, which `git add` treats as fatal.
+      // The index column keeps reporting a deletion the base tree already
+      // holds; `changedPaths` explains why that path must not be restaged.
       rmSync(join(dir, 'tracked.txt'));
       const first = await captureDirtyState(dir, repo, {
         runner,
@@ -394,7 +414,9 @@ describe('captureDirtyState', () => {
 
     it('treats a reported path as a literal name, not a pathspec expression', async () => {
       // A leading `:` makes git read the argument as magic: `:(exclude)a.txt`
-      // would drop the file from the capture and report success.
+      // would drop the file from the capture and report success. What prevents
+      // it is `GIT_LITERAL_PATHSPECS` in the runner's environment, so a failure
+      // here points there rather than at this file.
       writeFileSync(join(dir, 'tracked.txt'), 'edited\n');
       const base = git('rev-parse', 'HEAD^{tree}').trim();
 
@@ -439,7 +461,7 @@ describe('captureDirtyState', () => {
         (_, i) => `${filler}-${String(i).padStart(4, '0')}.txt`,
       );
       const budget = many.reduce((total, path) => total + Buffer.byteLength(path) + 1, 0);
-      expect(budget).toBeGreaterThan(96 * 1024);
+      expect(budget).toBeGreaterThan(MAX_PATHSPEC_BYTES);
 
       for (const path of many) writeFileSync(join(dir, path), `${path}\n`);
       const { runner: counting, verbs } = recording();
@@ -484,14 +506,19 @@ describe('captureDirtyState', () => {
   describe('against a repository configured to write while it reads', () => {
     it.each([
       ['core.splitIndex', 'true'],
-      ['core.fsmonitor', 'true'],
+      // A hook path rather than `true`: the builtin daemon starts
+      // asynchronously and drops a socket into `.git`, which would race the
+      // listing this asserts on.
+      ['core.fsmonitor', './no-such-hook'],
       ['core.untrackedCache', 'true'],
     ])('leaves the git directory alone with %s set', async (key, value) => {
-      // Repository-local config is the layer the runner's environment scrubbing
-      // cannot reach. The split index in particular puts a `sharedindex.*` file
-      // in `$GIT_DIR` on every index write, whatever `GIT_INDEX_FILE` says —
-      // and the user most likely to have it on is the one with the big
-      // repository this is built for.
+      // The split index puts a `sharedindex.*` file in `$GIT_DIR` on every
+      // index write, whatever `GIT_INDEX_FILE` says, and the user most likely
+      // to have it on is the one with the big repository this is built for.
+      //
+      // What keeps this green lives in the runner, not here: it passes
+      // `-c core.splitIndex=false` alongside `core.fsmonitor=`. A failure in
+      // this test points at that argv, not at this file.
       git('config', key, value);
       writeFileSync(join(dir, 'tracked.txt'), 'modified\n');
 
@@ -503,6 +530,44 @@ describe('captureDirtyState', () => {
     });
   });
 
+  describe('under a sparse checkout', () => {
+    it.each([
+      ['a cone', false],
+      ['a cone with a sparse index', true],
+    ])('keeps files outside %s in the snapshot', async (_name, sparseIndex) => {
+      // Sparse checkout removes them from disk, and `add -A` stages absent files
+      // as deletions, so the tree could silently lose everything outside the
+      // cone. What prevents that is `git add` itself: it reads
+      // `core.sparseCheckout` and the pattern file and leaves out-of-cone paths
+      // alone. Not skip-worktree bits — a plain `read-tree` into a fresh index
+      // sets none, measured with `ls-files -v`.
+      //
+      // So `core.sparseCheckout` must stay readable. Scrubbing it the way the
+      // runner scrubs `core.splitIndex` would delete every out-of-cone file from
+      // every snapshot, and this test is what would catch that.
+      mkdirSync(join(dir, 'inside'));
+      mkdirSync(join(dir, 'outside'));
+      writeFileSync(join(dir, 'inside', 'a.txt'), 'in\n');
+      writeFileSync(join(dir, 'outside', 'b.txt'), 'out\n');
+      git('add', '-A');
+      git('commit', '-qm', 'two directories');
+
+      git('sparse-checkout', 'init', '--cone');
+      if (sparseIndex) git('config', 'index.sparse', 'true');
+      git('sparse-checkout', 'set', 'inside');
+      // Dirty, so the tree is one `add -A` built under sparsity rather than one
+      // that matches HEAD whatever happened.
+      writeFileSync(join(dir, 'inside', 'a.txt'), 'edited under a cone\n');
+
+      const snapshot = await leavingUserStateIntact(() => captureDirtyState(dir, repo, { runner }));
+
+      expect(existsSync(join(dir, 'outside', 'b.txt'))).toBe(false);
+      expect(git('show', `${snapshot.treeOid}:inside/a.txt`)).toBe('edited under a cone\n');
+      expect(treePaths(snapshot.treeOid)).toContain('outside/b.txt');
+      expect(snapshot.clean).toBe(false);
+    });
+  });
+
   describe('a linked worktree', () => {
     it('captures the worktree it was given, not the main checkout', async () => {
       // `worktreePath` and `repo` differ here, which is the reason they are
@@ -511,17 +576,52 @@ describe('captureDirtyState', () => {
       const linked = join(dir, '..', `${basename(dir)}-wt`);
       git('branch', 'side');
       git('worktree', 'add', '-q', linked, 'side');
+      const inLinked = (...args: string[]): string =>
+        execFileSync('git', ['-C', linked, ...args], { stdio: 'pipe', encoding: 'utf8' });
+
+      // Committed, and divergent: a capture that read the main checkout's HEAD
+      // would still restage this worktree and produce a plausible tree, so the
+      // two branches have to disagree for the assertions to mean anything.
       writeFileSync(join(linked, 'only-here.txt'), 'linked\n');
+      inLinked('add', '-A');
+      inLinked('commit', '-qm', 'side only');
+      const sideTree = inLinked('rev-parse', 'side^{tree}').trim();
+      const linkedIndex = join(dir, '.git', 'worktrees', basename(linked), 'index');
+      const linkedBefore = { bytes: indexBytes(linkedIndex), mtime: indexMtime(linkedIndex) };
 
       try {
         const snapshot = await leavingUserStateIntact(() =>
           captureDirtyState(realpathSync(linked), repo, { runner }),
         );
 
+        expect(snapshot.treeOid).toBe(sideTree);
+        // This is the assertion that discriminates. The tree matches either
+        // way — `add -A` restages this worktree whichever HEAD was read — so
+        // only `clean`, which compares against that HEAD, can tell them apart.
+        expect(snapshot.clean).toBe(true);
         expect(treePaths(snapshot.treeOid)).toContain('only-here.txt');
+        // The index at risk here is this worktree's, not the main one, and the
+        // mtime matters for the same reason it does there.
+        expect(indexBytes(linkedIndex)).toBe(linkedBefore.bytes);
+        expect(indexMtime(linkedIndex)).toBe(linkedBefore.mtime);
       } finally {
         rmSync(linked, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('splitting a path list', () => {
+    it('never yields an empty group, which would stage the whole worktree', () => {
+      // `git add -A --` with no pathspec stages everything, so an empty chunk
+      // turns a scoped capture into a silent whole-tree one.
+      expect([...chunkPaths([])]).toEqual([]);
+      expect([...chunkPaths(['a.txt'])]).toEqual([['a.txt']]);
+    });
+
+    it('sends a path over the ceiling on its own rather than dropping it', () => {
+      const huge = 'x'.repeat(MAX_PATHSPEC_BYTES + 1);
+
+      expect([...chunkPaths([huge, 'small.txt'])]).toEqual([[huge], ['small.txt']]);
     });
   });
 
@@ -561,15 +661,19 @@ describe('captureDirtyState', () => {
     });
 
     it('removes the temporary index on the error path', async () => {
-      const indexDirs = (): string[] =>
-        readdirSync(tmpdir()).filter((entry) => entry.startsWith('interlock-index-'));
-      const before = new Set(indexDirs());
+      // A private root, so a capture running in another worker cannot leave
+      // something here for this assertion to blame on the failure path.
+      const tempDir = realpathSync(mkdtempSync(join(tmpdir(), 'interlock-temproot-')));
 
-      await expect(
-        captureDirtyState(dir, repo, { runner: failingAt('write-tree') }),
-      ).rejects.toThrow('injected failure');
+      try {
+        await expect(
+          captureDirtyState(dir, repo, { runner: failingAt('write-tree'), tempDir }),
+        ).rejects.toThrow('injected failure');
 
-      expect(indexDirs().filter((entry) => !before.has(entry))).toEqual([]);
+        expect(readdirSync(tempDir)).toEqual([]);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
     });
   });
 });

@@ -29,10 +29,10 @@ import { parseStatus } from './status.js';
  * any real limit rather than at it — on POSIX. Windows caps a command line near
  * 32 KB, so a port revisits this number rather than discovering it.
  */
-const MAX_PATHSPEC_BYTES = 96 * 1024;
+export const MAX_PATHSPEC_BYTES = 96 * 1024;
 
-/** Object ids as git writes them: hex, and long enough to be one. */
-const OBJECT_ID = /^[0-9a-f]{40,64}$/u;
+/** Object ids as git writes them: SHA-1 or SHA-256 length, and nothing between. */
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 
 /**
  * What a capture is allowed to look at.
@@ -62,6 +62,12 @@ export interface SnapshotOptions {
   readonly runner: GitRunner;
   /** Defaults to a whole-tree capture, which is always correct and never cheap. */
   readonly scope?: SnapshotScope;
+  /**
+   * Existing directory the temporary index is created under. Defaults to the
+   * system temp directory, which on many machines is a small tmpfs — and the
+   * index of a large repository is not small.
+   */
+  readonly tempDir?: string;
 }
 
 export interface WorktreeSnapshot {
@@ -88,10 +94,20 @@ export interface WorktreeSnapshot {
  * Read-only with respect to everything a user can lose. The only write is to
  * the object database, which is additive.
  *
+ * A submodule is recorded as the gitlink its superproject holds, so uncommitted
+ * work inside one is not part of this.
+ *
+ * Throwing is ordinary. A file reported by the watcher and deleted before it is
+ * staged fails the capture, so a caller has to treat a thrown capture as
+ * non-fatal and keep the base tree it already had — advancing the base on a
+ * failure loses the interval, and treating the throw as fatal turns an editor
+ * race into a crash.
+ *
  * @param worktreePath the worktree to capture, which for a linked worktree is
  *        not `repo.rootPath`.
- * @param repo the repository that worktree belongs to; its git directory is
- *        one of the places the temporary index must not land.
+ * @param repo the repository that worktree belongs to. Its git directory is
+ *        passed to the runner, which is where a redirected index is checked
+ *        against it.
  */
 export async function captureDirtyState(
   worktreePath: string,
@@ -103,11 +119,12 @@ export async function captureDirtyState(
   const worktree: UserRepo = { kind: 'user', rootPath: worktreePath, gitDir: repo.gitDir };
   const { runner } = options;
   const scope = options.scope ?? { kind: 'whole-tree' };
+  const tempDir = options.tempDir ?? tmpdir();
 
   const headTree = await resolveTree(worktree, runner, 'HEAD^{tree}');
   // Stamped when the tree is written rather than when the capture began: it
   // describes what was read, and reading takes time a watcher may care about.
-  const describe = (treeOid: string, takenAs: SnapshotScope['kind']): WorktreeSnapshot => ({
+  const asSnapshot = (treeOid: string, takenAs: SnapshotScope['kind']): WorktreeSnapshot => ({
     treeOid,
     clean: headTree !== null && treeOid === headTree,
     takenAs,
@@ -123,11 +140,11 @@ export async function captureDirtyState(
     assertInsideWorktree(scope.paths);
     const base = await resolveTree(worktree, runner, `${scope.baseTreeOid}^{tree}`);
     if (base !== null) {
-      return describe(await extendTree(worktree, runner, base, scope.paths), 'scoped');
+      return asSnapshot(await extendTree(worktree, runner, tempDir, base, scope.paths), 'scoped');
     }
   }
 
-  return describe(await buildTree(worktree, runner, headTree), 'whole-tree');
+  return asSnapshot(await buildTree(worktree, runner, tempDir, headTree), 'whole-tree');
 }
 
 /**
@@ -194,7 +211,14 @@ async function changedPaths(
       // A rename's source needs no special handling for the same reason: git
       // reports it as a deletion in this column and its destination as
       // untracked, so both arrive on their own account.
-      if (entry.worktree !== ' ') reported.add(entry.path);
+      if (entry.worktree === ' ') continue;
+      reported.add(entry.path);
+      // Scoped to the worktree column: an index-column rename names a source
+      // that is already absorbed into the base tree and no longer on disk,
+      // which is the case the column filter exists to drop.
+      if ((entry.worktree === 'R' || entry.worktree === 'C') && entry.origPath !== null) {
+        reported.add(entry.origPath);
+      }
     }
   }
 
@@ -225,6 +249,15 @@ function assertObjectId(oid: string): void {
  */
 function assertInsideWorktree(paths: readonly string[]): void {
   for (const path of paths) {
+    // `''` and `.` both normalise to the worktree root, which git reads as
+    // every path in it — a scoped capture that quietly became a whole-tree one.
+    if (path === '' || normalize(path) === '.') {
+      throw new InterlockError('GIT_COMMAND_REFUSED', 'Snapshot paths name a file that changed', {
+        details: { path },
+        remedy: 'Report each changed path relative to the worktree root.',
+      });
+    }
+
     const normalised = normalize(path);
     if (isAbsolute(normalised) || normalised === '..' || normalised.startsWith(`..${sep}`)) {
       throw new InterlockError(
@@ -248,10 +281,11 @@ function assertInsideWorktree(paths: readonly string[]): void {
 async function extendTree(
   worktree: UserRepo,
   runner: GitRunner,
+  tempDir: string,
   baseTree: string,
   paths: readonly string[],
 ): Promise<string> {
-  return withTemporaryIndex(async (indexFile) => {
+  return withTemporaryIndex(tempDir, async (indexFile) => {
     await runRequired(runner, worktree, ['read-tree', baseTree], { indexFile });
 
     const changed = await changedPaths(worktree, runner, indexFile, paths);
@@ -278,9 +312,10 @@ async function extendTree(
 async function buildTree(
   worktree: UserRepo,
   runner: GitRunner,
+  tempDir: string,
   seedTree: string | null,
 ): Promise<string> {
-  return withTemporaryIndex(async (indexFile) => {
+  return withTemporaryIndex(tempDir, async (indexFile) => {
     await runRequired(
       runner,
       worktree,
@@ -307,8 +342,11 @@ async function writeTree(
  * The directory is created first so the file has an existing parent: the runner
  * resolves the path through `realpath` and refuses one it cannot verify.
  */
-async function withTemporaryIndex<T>(use: (indexFile: string) => Promise<T>): Promise<T> {
-  const directory = await mkdtemp(join(tmpdir(), 'interlock-index-'));
+async function withTemporaryIndex<T>(
+  root: string,
+  use: (indexFile: string) => Promise<T>,
+): Promise<T> {
+  const directory = await mkdtemp(join(root, 'interlock-index-'));
   try {
     return await use(join(directory, 'index'));
   } finally {
@@ -319,8 +357,14 @@ async function withTemporaryIndex<T>(use: (indexFile: string) => Promise<T>): Pr
   }
 }
 
-/** Split paths into groups that fit in one command line. */
-function* chunkPaths(paths: readonly string[]): Generator<string[]> {
+/**
+ * Split paths into groups that fit in one command line.
+ *
+ * Never yields an empty group: `git add -A --` with no pathspec stages the
+ * whole worktree, so an empty chunk would quietly widen a scoped capture. A
+ * single path over the ceiling goes alone rather than being dropped.
+ */
+export function* chunkPaths(paths: readonly string[]): Generator<string[]> {
   let chunk: string[] = [];
   let bytes = 0;
 

@@ -92,12 +92,16 @@ describe('extractChangeSet', () => {
     git('config', 'user.email', 'test@example.invalid');
 
     writeFileSync(join(dir, 'edited.txt'), 'one\ntwo\nthree\nfour\nfive\n');
-    writeFileSync(join(dir, 'renamed-from.txt'), 'stays the same\n');
+    writeFileSync(join(dir, 'renamed-from.txt'), 'one\ntwo\nthree\nfour\nfive\nsix\n');
     writeFileSync(join(dir, 'deleted.txt'), 'goes away\n');
     writeFileSync(join(dir, 'mode.sh'), '#!/bin/sh\n');
     // NUL bytes are what make git call a file binary; random bytes alone do not.
     writeFileSync(join(dir, 'image.bin'), Buffer.from([0x89, 0x00, 0x01, 0x02, 0x00, 0xff]));
     writeFileSync(join(dir, 'has space.txt'), 'spaced\n');
+    // Renamed rather than edited in `commitEveryShape`: `--numstat -z` reports
+    // a rename as an empty path in the counts field followed by the source and
+    // destination, and nothing else in the fixture reaches that branch.
+    writeFileSync(join(dir, 'moved.bin'), Buffer.from([0x00, 0x11, 0x00, 0x22]));
     git('add', '-A');
     git('commit', '-qm', 'base');
     base = git('rev-parse', 'HEAD').trim();
@@ -113,9 +117,14 @@ describe('extractChangeSet', () => {
   const commitEveryShape = (): string => {
     writeFileSync(join(dir, 'edited.txt'), 'ONE\ntwo\nthree\nFOUR\nfive\nsix\n');
     git('mv', 'renamed-from.txt', 'renamed-to.txt');
+    // Edited as well as moved: a rename with no content change has no patch
+    // section, so the alignment for a hunk-bearing rename goes untested. One
+    // line of six, so similarity stays above git's rename threshold.
+    writeFileSync(join(dir, 'renamed-to.txt'), 'one\ntwo\nTHREE\nfour\nfive\nsix\n');
     rmSync(join(dir, 'deleted.txt'));
     chmodSync(join(dir, 'mode.sh'), 0o755);
     writeFileSync(join(dir, 'image.bin'), Buffer.from([0x89, 0x00, 0xaa, 0xbb, 0x00, 0x01]));
+    git('mv', 'moved.bin', 'moved-elsewhere.bin');
     writeFileSync(join(dir, 'has space.txt'), 'spaced differently\n');
     writeFileSync(join(dir, 'added.txt'), 'brand new\n');
     git('add', '-A');
@@ -175,6 +184,32 @@ describe('extractChangeSet', () => {
     expect(image?.binary).toBe(true);
     expect(image?.hunks).toEqual([]);
     expect(text?.binary).toBe(false);
+  });
+
+  it('flags a renamed binary under its destination', async () => {
+    // The rename branch of the numstat parser: git writes the counts with an
+    // empty path, then the source, then the destination. Reading the third
+    // column as the path would flag the source and leave the destination — the
+    // path the change is recorded under — reported as text.
+    const head = commitEveryShape();
+
+    const changeSet = await extractChangeSet(repo, branch(head), base, { runner });
+    const moved = changeSet.files.find((file) => file.path === 'moved-elsewhere.bin');
+
+    expect(moved?.kind).toBe('renamed');
+    expect(moved?.binary).toBe(true);
+    expect(changeSet.files.some((file) => file.path === 'moved.bin')).toBe(false);
+  });
+
+  it('gives a rename that also changed content its own hunks', async () => {
+    const head = commitEveryShape();
+
+    const changeSet = await extractChangeSet(repo, branch(head), base, { runner });
+    const renamed = changeSet.files.find((file) => file.path === 'renamed-to.txt');
+
+    expect(renamed?.kind).toBe('renamed');
+    expect(renamed?.hunks.length).toBeGreaterThan(0);
+    expect(renamed?.hunks.length).toBe(gitHunkCount(head, 'renamed-to.txt', 'renamed-from.txt'));
   });
 
   it('records a change that is only a mode as modified with no hunks', async () => {
@@ -310,6 +345,21 @@ describe('extractChangeSet', () => {
     expect(ours).not.toContain('C');
   });
 
+  it('records no copies when the repository asks for them', async () => {
+    // The test above pins git's flag semantics on raw output; this runs the
+    // module under the same config, which is what a watched repository would
+    // actually be doing to it.
+    const head = commitEveryShape();
+    git('config', 'diff.renames', 'copies');
+
+    const changeSet = await extractChangeSet(repo, branch(head), base, { runner });
+
+    expect(changeSet.files.some((file) => file.kind === 'renamed')).toBe(true);
+    for (const file of changeSet.files) {
+      if (file.previousPath !== null) expect(file.kind).toBe('renamed');
+    }
+  });
+
   it('keeps the hunk count a repository config would merge away', async () => {
     // `diff.interHunkContext` merges hunks that sit near each other, so two
     // separated edits are reported as one region. Same family as
@@ -376,9 +426,16 @@ describe('extractChangeSet', () => {
     ])('refuses %s as a revision', async (_name, value) => {
       // The same guard as `extractChangeSet`, reached through the other entry
       // point — which is the call site that had no test of its own.
+      const marker = join(dir, '..', `${basename(dir)}-touched-by-git.txt`);
+
+      await expect(
+        touchedPaths(repo, branch(`--output=${marker}`), base, { runner }),
+      ).rejects.toThrow('not an object id');
       await expect(touchedPaths(repo, branch(value), base, { runner })).rejects.toThrow(
         'not an object id',
       );
+      // The throw is not the point; the file is.
+      expect(existsSync(marker)).toBe(false);
     });
 
     it('agrees with the change set about which files moved', async () => {

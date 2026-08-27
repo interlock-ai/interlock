@@ -9,7 +9,14 @@ import type { BranchRefId, ChangeSetId, SnapshotId } from '../ids.js';
 export interface ChangeSet {
   readonly id: ChangeSetId;
   readonly branchRefId: BranchRefId;
-  /** Working-tree snapshot this diff was computed from; null when clean. */
+  /**
+   * Working-tree snapshot this diff was computed from, or `null` when the
+   * branch head was compared instead.
+   *
+   * Not the same as "the worktree was clean": a dirty branch nobody snapshotted
+   * produces a head-only change set that reads identically, so this says which
+   * side was compared and never whether uncommitted work existed.
+   */
   readonly snapshotId: SnapshotId | null;
   /** Commit both sides descend from. */
   readonly mergeBaseSha: string;

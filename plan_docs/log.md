@@ -4,6 +4,15 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-08-27
+
+- **Checked, and the reported parser bug is not one.** A review put ~85% confidence on `--numstat -z` writing a rename as `-\t-\tfrom.bin` in one field, which would make the parser's rename branch dead and report a renamed binary as text. Measured against real git: the fields are `'-\t-\t'`, `'image.bin'`, `'renamed.bin'` — the counts field carries an empty path and the two paths follow, which is what the parser assumes and what its synthetic test encodes.
+- **The method behind the finding was right even though the finding was not.** The branch was reachable only through a synthetic input shaped like the assumption; nothing renamed a binary end to end. `commitEveryShape` now does, and inverting the rename branch fails that test as well as the unit one.
+- **Added:** a rename that also changes content. Every rename in the fixture was `R100`, so it had no patch section and the alignment for a hunk-bearing rename went unexercised. One line of six changes, which keeps similarity above git's rename threshold — two lines with one edited falls below it and git reports an addition, which is what the first attempt at this fixture did.
+- **Added:** `extractChangeSet` run under `diff.renames = copies`. The existing test pinned git's flag semantics on raw bytes; nothing ran the module under the config a watched repository would actually have set.
+- **Added:** the marker assertion to the `touchedPaths` revision guard. Its twin asserted the file was never written and this one only asserted the throw.
+- **Corrected:** `ChangeSet.snapshotId` was documented "null when clean", which is not what the code means. It records which side was compared, and a dirty branch nobody snapshotted produces a head-only change set that reads identically — the doc claimed a distinction the field cannot carry.
+
 ## 2026-08-26
 
 - **Checked the three cross-file items two reviews left open, and all three are already right.** No call site passes a glob or a magic pathspec — the only `*` handling in `core` is Interlock's own scanner, which never reaches git — so `GIT_LITERAL_PATHSPECS` is safe repo-wide. Discovery has no private `required` left; `runRequired` is its only caller and no stderr reaches `remedy` or `details`, so the discipline moved with it. `groupStatus` is rebuilt on `isUnmerged`, and a test asserts a conflicted path counts once as unstaged.

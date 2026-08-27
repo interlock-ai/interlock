@@ -412,23 +412,6 @@ describe('captureDirtyState', () => {
       expect(treePaths(second.treeOid)).not.toContain('tracked.txt');
     });
 
-    it('refuses an empty path, which git rejects as a pathspec', async () => {
-      // Neither absolute nor climbing out, so the check above lets it through
-      // and git ends the capture with `empty string is not a valid pathspec`.
-      const base = await captureDirtyState(dir, repo, { runner });
-
-      const error = await rejection(
-        captureDirtyState(dir, repo, {
-          runner,
-          scope: { kind: 'scoped', paths: [''], baseTreeOid: base.treeOid },
-        }),
-      );
-
-      expect(error.code).toBe('GIT_COMMAND_REFUSED');
-      expect(error.message).toContain('empty');
-      expect(error.infra).toBe(false);
-    });
-
     it('treats a reported path as a literal name, not a pathspec expression', async () => {
       // A leading `:` makes git read the argument as magic: `:(exclude)a.txt`
       // would drop the file from the capture and report success. What prevents

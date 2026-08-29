@@ -710,6 +710,64 @@ describe('store', () => {
     });
   });
 
+  /**
+   * A file written by a build that knew a value this one does not. Passing it
+   * through would put a verdict no analyzer produced, or a status no rule
+   * assigned, in front of the scheduler as though it were real.
+   */
+  describe('enumerated columns', () => {
+    let repoId: RepoId;
+    let findingId: FindingId;
+    let runId: SpeculativeRunId;
+
+    beforeEach(async () => {
+      repoId = (await store.upsertRepo(repo())).id;
+      const a = (await store.upsertBranchRef(branch(repoId, { ref: 'refs/heads/a', name: 'a' })))
+        .id;
+      const b = (await store.upsertBranchRef(branch(repoId, { ref: 'refs/heads/b', name: 'b' })))
+        .id;
+      const pairId = (await store.upsertMergePair(pair(repoId, a, b))).id;
+      const speculative = run(pairId);
+      runId = speculative.id;
+      await store.upsertRun(speculative);
+      const raised = finding(runId, a, b);
+      findingId = raised.id;
+      await store.upsertFinding(raised);
+      await store.upsertSession(session(repoId, { branchRefId: a }));
+      await store.putCachedVerdict('k', {
+        analyzer: 'build',
+        verdict: 'clean',
+        findingIds: [],
+        durationMs: 1,
+        cached: false,
+        diagnostic: null,
+      });
+    });
+
+    const columns: readonly [string, string, (open: Store) => Promise<unknown>][] = [
+      ['agent_sessions', 'kind', (open) => open.listSessions(repoId)],
+      ['speculative_runs', 'status', (open) => open.getRun(runId)],
+      ['findings', 'kind', (open) => open.getFinding(findingId)],
+      ['findings', 'severity', (open) => open.getFinding(findingId)],
+      ['findings', 'status', (open) => open.getFinding(findingId)],
+      ['analyzer_cache', 'analyzer', (open) => open.getCachedVerdict('k')],
+      ['analyzer_cache', 'verdict', (open) => open.getCachedVerdict('k')],
+    ];
+
+    it.each(columns)('refuses an unrecognised %s.%s', async (table, column, read) => {
+      await store.close();
+      const db = new DatabaseSync(dbPath);
+      db.exec(`UPDATE ${table} SET ${column} = 'not-a-value'`);
+      db.close();
+      store = await openStore({ path: dbPath });
+
+      const error = await rejection(read(store));
+
+      expect(error.code).toBe('STORE_UNAVAILABLE');
+      expect(error.message).toContain(column);
+    });
+  });
+
   describe('the event log', () => {
     it('replays in id order regardless of insertion order', async () => {
       const first = event();

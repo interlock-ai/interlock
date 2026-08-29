@@ -145,17 +145,14 @@ const BUSY_TIMEOUT_MS = 5_000;
 const EVENT_REPLAY_BATCH = 500;
 
 /**
- * Run synchronous work as a promise.
+ * The row a `RETURNING` clause produced.
  *
- * `node:sqlite` is synchronous while this interface is not, and a method that
- * throws where it says it rejects breaks every caller that attaches `.catch`
- * instead of awaiting.
+ * It always produces one; the driver's signature cannot say so, and reading
+ * `undefined` as an empty row reports the failure as a corrupt column
+ * somewhere downstream.
  */
 function returned(row: Row | undefined): Row {
   if (row === undefined) {
-    // A statement with a RETURNING clause always produces its row; the driver's
-    // signature cannot say so, and reading `undefined` as an empty row would
-    // report the failure as a corrupt column somewhere downstream.
     throw new InterlockError('STORE_UNAVAILABLE', 'An upsert returned no row', {
       remedy: 'Report this with the daemon log.',
       infra: true,
@@ -164,6 +161,12 @@ function returned(row: Row | undefined): Row {
   return row;
 }
 
+/**
+ * Run synchronous work as a promise.
+ *
+ * `node:sqlite` is synchronous while this interface is not, and a method that
+ * throws where it says it rejects breaks every caller attaching `.catch`.
+ */
 function settled<T>(work: () => T): Promise<T> {
   try {
     return Promise.resolve(work());
@@ -206,7 +209,9 @@ function open(options: StoreOptions): Store {
     chmodSync(dirname(path), DATA_DIR_MODE);
   }
 
-  const db = new DatabaseSync(path);
+  // Foreign keys are on by default; pinning it here keeps a change to that
+  // default from quietly turning the cascades into dangling rows.
+  const db = new DatabaseSync(path, { enableForeignKeyConstraints: true });
 
   if (path !== MEMORY_PATH) {
     // Before write-ahead logging is enabled, because SQLite creates `-wal` and
@@ -223,7 +228,6 @@ function open(options: StoreOptions): Store {
     log.warn('write-ahead logging unavailable', { journalMode });
   }
 
-  db.exec('PRAGMA foreign_keys = ON');
   db.exec(`PRAGMA busy_timeout = ${String(BUSY_TIMEOUT_MS)}`);
   // With WAL, NORMAL loses at most the last transaction to a power cut. The
   // store is a record of observable git state, which the next sweep re-derives.
@@ -568,15 +572,13 @@ class SqliteStore implements Store {
   }
 
   readEvents(since?: EventRecord['id']): AsyncIterable<EventRecord> {
-    // A synchronous generator behind the asynchronous interface the store
-    // declares. `node:sqlite` reads without yielding to the event loop, so an
-    // async generator here would be asynchronous only in its type.
+    // Synchronous behind the asynchronous interface: `node:sqlite` reads without
+    // yielding, so an async generator here would be async only in its type.
     const pages = this.#replay(since);
     return {
       [Symbol.asyncIterator]: (): AsyncIterator<EventRecord> => ({
         next: () => Promise.resolve(pages.next()),
-        // Consumers that stop early — `break`, or a thrown handler — close the
-        // generator through this.
+        // Closes the generator when a consumer stops early.
         return: () => Promise.resolve(pages.return(undefined)),
       }),
     };
@@ -613,8 +615,6 @@ class SqliteStore implements Store {
       // shape keeps an offset-bearing argument from comparing as another date.
       const cutoff = new Date(parsed).toISOString();
 
-      // `changes` is a bigint for a statement that could touch more rows than a
-      // double addresses, which no retention pass will.
       const deleted = this.#transaction(
         () =>
           Number(this.#statements.pruneEvents.run(cutoff).changes) +
@@ -636,12 +636,9 @@ class SqliteStore implements Store {
   }
 
   /**
-   * Replay the log from `since` to whatever the last event was when iteration
-   * began.
-   *
-   * The upper bound is fixed first: pagination reads committed rows as it goes,
-   * so a replay running against a live daemon would otherwise keep picking up
-   * events published while it ran and never reach the end.
+   * The upper bound is fixed before the first page: pagination reads committed
+   * rows as it goes, so a replay against a live daemon would otherwise keep
+   * picking up events published while it ran and never reach the end.
    */
   *#replay(since: EventRecord['id'] | undefined): Generator<EventRecord, void, undefined> {
     const upper = this.#maxEventId();

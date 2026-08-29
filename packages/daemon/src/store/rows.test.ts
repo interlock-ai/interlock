@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isInterlockError, ulid } from '@interlock/shared';
+import { ANALYZER_VERDICTS, isInterlockError, ulid } from '@interlock/shared';
 import type {
   AgentSessionId,
   AnalyzerResult,
@@ -23,6 +23,7 @@ import {
   mergePairParams,
   num,
   numOrNull,
+  oneOf,
   text,
   textOrNull,
   toAnalyzerResult,
@@ -72,6 +73,19 @@ describe('column readers', () => {
   it('reads SQLite integers as booleans', () => {
     expect(bool({ stale: 0 }, 'stale')).toBe(false);
     expect(bool({ stale: 1 }, 'stale')).toBe(true);
+  });
+
+  it('refuses a value outside the set the model defines', () => {
+    expect(oneOf({ verdict: 'clean' }, 'verdict', ANALYZER_VERDICTS)).toBe('clean');
+
+    const error = refusal(() => oneOf({ verdict: 'probably-fine' }, 'verdict', ANALYZER_VERDICTS));
+
+    expect(error.code).toBe('STORE_UNAVAILABLE');
+    expect(error.message).toContain('verdict');
+    expect(error.details).toEqual({
+      column: 'verdict',
+      expected: 'one of clean, findings, infra-failure, skipped, timeout',
+    });
   });
 
   it('reports a JSON column that no longer parses rather than throwing SyntaxError', () => {

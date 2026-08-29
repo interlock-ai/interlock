@@ -1,11 +1,16 @@
-import { InterlockError } from '@interlock/shared';
+import {
+  AGENT_KINDS,
+  ANALYZER_KINDS,
+  ANALYZER_VERDICTS,
+  FINDING_STATUSES,
+  InterlockError,
+  RUN_STATUSES,
+  SEVERITIES,
+} from '@interlock/shared';
 import type {
-  AgentKind,
   AgentSession,
   AgentSessionId,
-  AnalyzerKind,
   AnalyzerResult,
-  AnalyzerVerdict,
   BranchRef,
   BranchRefId,
   ChangeSet,
@@ -15,7 +20,6 @@ import type {
   FileChange,
   Finding,
   FindingId,
-  FindingStatus,
   InterlockEvent,
   MergeOutcome,
   MergePair,
@@ -24,8 +28,6 @@ import type {
   Repo,
   RepoConfigOverride,
   RepoId,
-  RunStatus,
-  Severity,
   SnapshotId,
   SpeculativeRun,
   SpeculativeRunId,
@@ -41,10 +43,15 @@ import type {
  * boolean stored as text, a JSON column that no longer parses. Pure functions,
  * so each of those is a unit test rather than a database.
  *
- * Reads are checked rather than cast. The schema is STRICT, so a column of the
- * wrong type means the file was written by something other than this code, and
- * a value that reaches a model unchecked fails somewhere with no bearing on
- * where the damage is.
+ * Scalar and enumerated columns are checked rather than cast. The schema is
+ * STRICT, so a column of the wrong type means the file was written by something
+ * other than this code, and a value that reaches a model unchecked fails
+ * somewhere with no bearing on where the damage is. An unrecognised verdict is
+ * the worse case: it reads as a real answer.
+ *
+ * JSON columns are parsed and trusted. Validating each would be a schema
+ * library, and the shapes they hold are the models this process wrote — the
+ * check that matters is that the text still parses at all.
  */
 
 export type Row = Record<string, unknown>;
@@ -93,6 +100,22 @@ export function bool(row: Row, column: string): boolean {
   return num(row, column) !== 0;
 }
 
+/**
+ * Read a column whose value must come from a known set.
+ *
+ * The set is the model's own list, so a value that is not in it was written by
+ * a different build. Refusing it is what keeps an unrecognised verdict from
+ * reaching the scheduler as though an analyzer had returned it.
+ */
+export function oneOf<T extends string>(row: Row, column: string, allowed: readonly T[]): T {
+  const value = text(row, column);
+  if (!(allowed as readonly string[]).includes(value)) {
+    throw corrupt(column, `one of ${allowed.join(', ')}`);
+  }
+  return value as T;
+}
+
+/** The parsed shape is trusted; only the parse itself is checked. */
 export function json<T>(row: Row, column: string): T {
   const raw = text(row, column);
   try {
@@ -181,7 +204,7 @@ export function toSession(row: Row): AgentSession {
   return {
     id: text(row, 'id') as AgentSessionId,
     repoId: text(row, 'repo_id') as RepoId,
-    kind: text(row, 'kind') as AgentKind,
+    kind: oneOf(row, 'kind', AGENT_KINDS),
     externalSessionId: textOrNull(row, 'external_session_id'),
     branchRefId: textOrNull(row, 'branch_ref_id') as BranchRefId | null,
     cwd: textOrNull(row, 'cwd'),
@@ -270,7 +293,7 @@ export function toRun(row: Row, findingIds: readonly FindingId[]): SpeculativeRu
     mergePairId: text(row, 'merge_pair_id') as MergePairId,
     snapshotA: text(row, 'snapshot_a') as SnapshotId,
     snapshotB: text(row, 'snapshot_b') as SnapshotId,
-    status: text(row, 'status') as RunStatus,
+    status: oneOf(row, 'status', RUN_STATUSES),
     mergeOutcome: jsonOrNull<MergeOutcome>(row, 'merge_outcome'),
     analyzerResults: json<AnalyzerResult[]>(row, 'analyzer_results'),
     findingIds,
@@ -301,11 +324,11 @@ export function toFinding(row: Row, evidence: readonly Evidence[]): Finding {
   return {
     id: text(row, 'id') as FindingId,
     runId: text(row, 'run_id') as SpeculativeRunId,
-    kind: text(row, 'kind') as AnalyzerKind,
+    kind: oneOf(row, 'kind', ANALYZER_KINDS),
     rule: text(row, 'rule'),
-    severity: text(row, 'severity') as Severity,
+    severity: oneOf(row, 'severity', SEVERITIES),
     confidence: num(row, 'confidence'),
-    status: text(row, 'status') as FindingStatus,
+    status: oneOf(row, 'status', FINDING_STATUSES),
     title: text(row, 'title'),
     description: text(row, 'description'),
     attribution: {
@@ -390,8 +413,8 @@ export function eventParams(record: EventRecord): Params {
  */
 export function toAnalyzerResult(row: Row): AnalyzerResult {
   return {
-    analyzer: text(row, 'analyzer') as AnalyzerKind,
-    verdict: text(row, 'verdict') as AnalyzerVerdict,
+    analyzer: oneOf(row, 'analyzer', ANALYZER_KINDS),
+    verdict: oneOf(row, 'verdict', ANALYZER_VERDICTS),
     findingIds: json<FindingId[]>(row, 'finding_ids'),
     durationMs: num(row, 'duration_ms'),
     cached: true,

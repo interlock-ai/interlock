@@ -236,6 +236,17 @@ describe('store', () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
+  /** Rows a cascade should have taken; the store exposes no reader for them. */
+  const countRows = (table: string): number => {
+    const db = new DatabaseSync(dbPath);
+    try {
+      const row = db.prepare(`SELECT count(*) AS n FROM ${table}`).get();
+      return typeof row?.n === 'number' ? row.n : -1;
+    } finally {
+      db.close();
+    }
+  };
+
   describe('the database file', () => {
     it('is owner-only, and so is every file SQLite writes beside it', async () => {
       // The `-wal` holds rows that have not reached the database yet, so a mode
@@ -920,9 +931,8 @@ describe('store', () => {
       await store.upsertRun(held);
       await store.upsertRun(spent);
       await store.upsertFinding(finding(held.id, a, b, { status: 'stale' }));
-      await store.upsertFinding(
-        finding(spent.id, a, b, { status: 'resolved', resolvedAt: T.early }),
-      );
+      const dropped = finding(spent.id, a, b, { status: 'resolved', resolvedAt: T.early });
+      await store.upsertFinding(dropped);
 
       await store.prune(T.mid);
 
@@ -930,6 +940,10 @@ describe('store', () => {
       // rather than resolve it.
       expect(await store.getRun(held.id)).not.toBeNull();
       expect(await store.getRun(spent.id)).toBeNull();
+      // `prune` deletes runs and counts only those, so the findings and evidence
+      // underneath them leave by cascade or not at all.
+      expect(await store.getFinding(dropped.id)).toBeNull();
+      expect(countRows('evidence')).toBe(dropped.evidence.length);
     });
 
     it('keeps an unfinished run whatever its age', async () => {

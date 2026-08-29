@@ -33,7 +33,13 @@ export function runMigrations(db: DatabaseSync, logger: Logger): number {
     if (migration.version <= current) continue;
 
     try {
-      db.exec('BEGIN');
+      // IMMEDIATE, not deferred. A deferred transaction reads first and asks for
+      // the write lock later, so a second daemon starting at the same moment is
+      // refused outright once the first commits — SQLITE_BUSY_SNAPSHOT, which
+      // the busy handler does not retry. Taking the lock up front makes the
+      // loser wait for the winner and then re-apply, which every migration here
+      // is required to tolerate.
+      db.exec('BEGIN IMMEDIATE');
       db.exec(migration.up);
       // A pragma takes no bound parameter. The value is this module's own
       // integer rather than anything a caller supplies.

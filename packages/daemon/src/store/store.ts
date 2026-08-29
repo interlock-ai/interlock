@@ -615,6 +615,8 @@ class SqliteStore implements Store {
       // shape keeps an offset-bearing argument from comparing as another date.
       const cutoff = new Date(parsed).toISOString();
 
+      // `changes` is a bigint only for a statement that could touch more rows
+      // than a double addresses, which no retention pass will.
       const deleted = this.#transaction(
         () =>
           Number(this.#statements.pruneEvents.run(cutoff).changes) +

@@ -47,8 +47,13 @@ export function runMigrations(db: DatabaseSync, logger: Logger): number {
       db.exec('COMMIT');
     } catch (error) {
       // A statement that fails inside `exec` leaves the transaction open; the
-      // next write would then join a transaction it did not start.
-      if (db.isTransaction) db.exec('ROLLBACK');
+      // next write would then join a transaction it did not start. A rollback
+      // that fails must not replace the error that caused it.
+      try {
+        if (db.isTransaction) db.exec('ROLLBACK');
+      } catch {
+        // Reported through the migration failure below.
+      }
       throw new InterlockError(
         'STORE_MIGRATION_FAILED',
         `Migration ${String(migration.version)} (${migration.name}) failed`,

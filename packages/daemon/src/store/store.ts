@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync, statSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { StatementSync } from 'node:sqlite';
@@ -57,6 +57,11 @@ import type { Row } from './rows.js';
  * The database lives under the Interlock data dir with owner-only permissions.
  * It holds no secrets and no full file contents — evidence stores spans and
  * truncated excerpts.
+ *
+ * A constraint violation reaches the caller as the driver's own error rather
+ * than an {@link InterlockError}: it means this code wrote a row naming a
+ * parent that does not exist, which is a bug here, and `infra` would file it as
+ * an environment failure. The message names the constraint that refused it.
  */
 
 export interface Store {
@@ -102,7 +107,13 @@ export interface Store {
 
   /** Append-only: there is no update or delete path for events. */
   appendEvent(record: EventRecord): Promise<void>;
-  /** Replay in id order; ULIDs sort by creation time. */
+  /**
+   * Replay in id order; ULIDs sort by creation time.
+   *
+   * Paged, so a {@link Store.prune} running against a long replay can remove
+   * rows the iteration has not reached. That is retention doing its job, and a
+   * replay older than the window was already incomplete.
+   */
   readEvents(since?: EventRecord['id']): AsyncIterable<EventRecord>;
 
   /** Cached analyzer verdict for (snapshotA, snapshotB, analyzer, toolchain). */
@@ -203,10 +214,17 @@ function open(options: StoreOptions): Store {
   }
 
   if (path !== MEMORY_PATH) {
-    // `mkdir` masks its mode with the umask, and the directory usually exists
-    // already, so the mode is set rather than requested.
-    mkdirSync(dirname(path), { recursive: true, mode: DATA_DIR_MODE });
-    chmodSync(dirname(path), DATA_DIR_MODE);
+    const parent = dirname(path);
+    // Only a directory this call created gets its mode set — `mkdir` masks the
+    // mode it is given with the umask. Tightening one that was already there
+    // would reach outside Interlock's own data dir: `openStore` takes any path,
+    // and a database put in a home or a shared directory must not silently
+    // change that directory for everything else using it.
+    if (mkdirSync(parent, { recursive: true, mode: DATA_DIR_MODE }) !== undefined) {
+      chmodSync(parent, DATA_DIR_MODE);
+    } else if ((statSync(parent).mode & 0o077) !== 0) {
+      log.warn('the directory holding the store is readable beyond its owner', { parent });
+    }
   }
 
   // Foreign keys are on by default; pinning it here keeps a change to that
@@ -662,16 +680,27 @@ class SqliteStore implements Store {
   }
 
   #transaction<T>(work: () => T): T {
-    this.#db.exec('BEGIN');
+    // IMMEDIATE: every transaction here writes, and a deferred one takes its
+    // read snapshot first — so a second daemon that commits in between refuses
+    // this one outright with a lock error the busy handler does not retry.
+    this.#db.exec('BEGIN IMMEDIATE');
     try {
       const result = work();
       this.#db.exec('COMMIT');
       return result;
     } catch (error) {
-      // A failed statement leaves the transaction open, and the next write would
-      // then join one it did not start.
-      if (this.#db.isTransaction) this.#db.exec('ROLLBACK');
+      this.#rollback();
       throw error;
+    }
+  }
+
+  /** A failed statement leaves the transaction open for the next write to join. */
+  #rollback(): void {
+    try {
+      if (this.#db.isTransaction) this.#db.exec('ROLLBACK');
+    } catch {
+      // The error that caused the rollback is the diagnosis; this one would
+      // replace it with a symptom.
     }
   }
 }

@@ -287,6 +287,14 @@ every task here and is not repeated per task.
   A refusal on re-read keeps the last good config and surfaces the problem; it
   must not take the repository out of the watch set.
 
+  **The store has no deletion path, and this is where it is needed.** Upserts
+  reconcile on the natural key, so a branch that stops existing keeps its row,
+  its merge pairs and its change sets forever — and `prune` deliberately keeps
+  each branch's newest change set, so retention never reaches them either. The
+  watcher is what notices a branch is gone, so the `Store` grows the deletion
+  API here rather than earlier: removing a branch takes its pairs and change
+  sets with it by cascade, and `branch.disappeared` is the event that drives it.
+
   **Contain a failing repository to itself.** `describeRepo` throws
   `CONFIG_INVALID` for one repository's broken file, and discovery reads
   repositories in a sweep. One bad `.interlock.json` must not stop the others,

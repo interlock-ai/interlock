@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { makePairKey, silentLogger, ulid } from '@interlock/shared';
+import { createLogger, makePairKey, silentLogger, ulid } from '@interlock/shared';
 import type {
   AgentSession,
   AgentSessionId,
@@ -14,6 +14,7 @@ import type {
   DirtyState,
   EventId,
   EventRecord,
+  LogRecord,
   Finding,
   FindingId,
   MergePair,
@@ -224,9 +225,6 @@ describe('store', () => {
 
   beforeEach(async () => {
     dataDir = join(mkdtempSync(join(tmpdir(), 'interlock-store-')), 'data');
-    // Group- and world-readable, so the mode assertion measures what `openStore`
-    // did rather than what the umask happened to allow.
-    mkdirSync(dataDir, { recursive: true, mode: 0o755 });
     dbPath = join(dataDir, 'interlock.db');
     store = await openStore({ path: dbPath });
   });
@@ -248,6 +246,47 @@ describe('store', () => {
   };
 
   describe('the database file', () => {
+    it('leaves a directory it did not create alone', async () => {
+      // `openStore` takes any path. A database dropped in a home or a shared
+      // directory must not tighten that directory for everything else using it.
+      const existing = join(mkdtempSync(join(tmpdir(), 'interlock-shared-')), 'shared');
+      mkdirSync(existing, { mode: 0o755 });
+      const records: LogRecord[] = [];
+      const logger = createLogger('test', { level: 'trace', sink: (r) => records.push(r) });
+
+      const opened = await openStore({ path: join(existing, 'interlock.db'), logger });
+      try {
+        expect(statSync(existing).mode & 0o777).toBe(0o755);
+        // Silence would leave a loose directory looking deliberate.
+        expect(records.map((r) => r.msg)).toContain(
+          'the directory holding the store is readable beyond its owner',
+        );
+        // The database itself is owner-only wherever it lands.
+        expect(statSync(join(existing, 'interlock.db')).mode & 0o777).toBe(0o600);
+      } finally {
+        await opened.close();
+        rmSync(existing, { recursive: true, force: true });
+      }
+    });
+
+    it('sets the mode on a directory it creates under a hostile umask', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'interlock-umask-'));
+      // `mkdir`'s mode is masked, and 0700 survives an ordinary umask untouched
+      // — only one clearing owner bits shows whether the mode is set as well as
+      // requested.
+      const previous = process.umask(0o0300);
+      try {
+        const nested = join(root, 'data');
+        const opened = await openStore({ path: join(nested, 'interlock.db') });
+        await opened.close();
+
+        expect(statSync(nested).mode & 0o777).toBe(0o700);
+      } finally {
+        process.umask(previous);
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it('is owner-only, and so is every file SQLite writes beside it', async () => {
       // The `-wal` holds rows that have not reached the database yet, so a mode
       // applied only to the main file leaks exactly the most recent state.
@@ -262,6 +301,7 @@ describe('store', () => {
         'interlock.db-wal': 0o600,
         'interlock.db-shm': 0o600,
       });
+      // The data dir is Interlock's own — this call created it.
       expect(statSync(dataDir).mode & 0o777).toBe(0o700);
     });
 
@@ -363,14 +403,14 @@ describe('store', () => {
   describe('repos', () => {
     it('reconciles a second sighting onto the first row', async () => {
       const first = await store.upsertRepo(repo());
-      const second = await store.upsertRepo(
-        repo({
-          defaultBranch: 'trunk',
-          config: { ignore: ['dist/**'] },
-          discoveredAt: T.late,
-          lastSeenAt: T.late,
-        }),
-      );
+      const resighted = repo({
+        defaultBranch: 'trunk',
+        config: { ignore: ['dist/**'] },
+        discoveredAt: T.late,
+        lastSeenAt: T.late,
+      });
+      expect(resighted.shadowPath).not.toBe(first.shadowPath);
+      const second = await store.upsertRepo(resighted);
 
       expect(await store.listRepos()).toHaveLength(1);
       // Discovery mints a fresh ULID per sweep; keying on it would insert a row
@@ -378,6 +418,8 @@ describe('store', () => {
       expect(second.id).toBe(first.id);
       // Derived from the id that won: the incoming one names a directory built
       // from a ULID that was discarded, while the clone sits at the stored one.
+      // The fixture derives it from the id, so the two genuinely differ — a
+      // change that made them equal would leave this assertion vacuous.
       expect(second.shadowPath).toBe(first.shadowPath);
       expect(second.discoveredAt).toBe(T.early);
       expect(second.lastSeenAt).toBe(T.late);
@@ -721,6 +763,22 @@ describe('store', () => {
     });
   });
 
+  it('names the column when a JSON payload no longer parses', async () => {
+    await store.upsertRepo(repo());
+    await store.close();
+
+    const db = new DatabaseSync(dbPath);
+    db.exec("UPDATE repos SET config = '{'");
+    db.close();
+    store = await openStore({ path: dbPath });
+
+    const error = await rejection(store.listRepos());
+
+    expect(error.code).toBe('STORE_UNAVAILABLE');
+    expect(error.details).toEqual({ column: 'config' });
+    expect(error.infra).toBe(true);
+  });
+
   /**
    * A file written by a build that knew a value this one does not. Passing it
    * through would put a verdict no analyzer produced, or a status no rule
@@ -979,6 +1037,28 @@ describe('store', () => {
       // A branch idle for longer than the window still has a current change set,
       // and it is the only record of what that branch is carrying.
       expect(await store.getChangeSet(only.id)).not.toBeNull();
+    });
+
+    it('keeps change sets that share a timestamp until a newer one arrives', async () => {
+      const repoId = (await store.upsertRepo(repo())).id;
+      const branchRefId = (await store.upsertBranchRef(branch(repoId))).id;
+      const twin = changeSet(branchRefId, { computedAt: T.early });
+      const sibling = changeSet(branchRefId, { computedAt: T.early });
+      await store.upsertChangeSet(twin);
+      await store.upsertChangeSet(sibling);
+
+      await store.prune(T.late);
+
+      // "Superseded" is strictly newer, so two computed in the same millisecond
+      // supersede nothing and both stay. Conservative on purpose: the wrong way
+      // round would drop a branch's only surviving record of its work.
+      expect(await store.getChangeSet(twin.id)).not.toBeNull();
+      expect(await store.getChangeSet(sibling.id)).not.toBeNull();
+
+      await store.upsertChangeSet(changeSet(branchRefId, { computedAt: T.mid }));
+      await store.prune(T.late);
+      expect(await store.getChangeSet(twin.id)).toBeNull();
+      expect(await store.getChangeSet(sibling.id)).toBeNull();
     });
 
     it('drops cached verdicts past the window', async () => {

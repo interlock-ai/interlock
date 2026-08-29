@@ -494,11 +494,13 @@ describe('store', () => {
       expect(unknown.dirty).toBeNull();
     });
 
-    it('round-trips a dirty state with its file lists', async () => {
-      const dirty = dirtyState();
-      const stored = await store.upsertBranchRef(branch(repoId, { dirty }));
+    it('round-trips every field of a branch', async () => {
+      const ref = branch(repoId, { dirty: dirtyState() });
 
-      expect(stored.dirty).toEqual(dirty);
+      // Whole-object equality, not a field at a time: a model that gains a field
+      // without a column to hold it fails here, which is the drift a schema
+      // generated from the models would have caught at build time.
+      expect(await store.upsertBranchRef(ref)).toEqual(ref);
     });
 
     it('forgets a dirty state when the worktree becomes unreadable', async () => {
@@ -562,14 +564,13 @@ describe('store', () => {
       expect(await store.listSessions(repoId)).toHaveLength(2);
     });
 
-    it('updates a session in place on its id', async () => {
+    it('updates a session in place on its id, round-tripping every field', async () => {
       const driver = session(repoId);
       await store.upsertSession(driver);
-      await store.upsertSession({ ...driver, branchRefId, lastActiveAt: T.late });
+      const moved = { ...driver, branchRefId, lastActiveAt: T.late };
+      await store.upsertSession(moved);
 
-      const sessions = await store.listSessions(repoId);
-      expect(sessions).toHaveLength(1);
-      expect(sessions[0]?.branchRefId).toBe(branchRefId);
+      expect(await store.listSessions(repoId)).toEqual([moved]);
     });
   });
 
@@ -602,14 +603,14 @@ describe('store', () => {
 
     it('treats (A,B) and (B,A) as one row', async () => {
       const first = await store.upsertMergePair(pair(repoId, a, b));
-      const second = await store.upsertMergePair(pair(repoId, b, a, { priority: 9, stale: true }));
+      const reversed = pair(repoId, b, a, { priority: 9, stale: true });
+      const second = await store.upsertMergePair(reversed);
 
       expect(await store.listMergePairs(repoId)).toHaveLength(1);
       // Unordered is load-bearing: two rows would mean two cache entries for one
-      // pair, and the second would never see the first's results.
-      expect(second.id).toBe(first.id);
-      expect(second.priority).toBe(9);
-      expect(second.stale).toBe(true);
+      // pair, and the second would never see the first's results. The stored
+      // orientation wins; everything else is this sighting's.
+      expect(second).toEqual({ ...reversed, id: first.id, a: first.a, b: first.b });
     });
 
     it('orders by priority so the scheduler reads the queue as it stands', async () => {

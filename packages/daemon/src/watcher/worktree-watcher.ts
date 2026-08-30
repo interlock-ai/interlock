@@ -123,7 +123,7 @@ export function createWorktreeWatcher(options: WorktreeWatcherOptions): Worktree
         worktreePath: identity.worktreePath,
         // The empty string is how an unnamed event is carried through the
         // batch; it is not a path anyone can act on.
-        paths: values,
+        paths: values.filter((value) => value !== ''),
       });
     },
   });

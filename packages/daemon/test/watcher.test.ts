@@ -8,7 +8,11 @@ import { createLogger } from '@interlock/shared';
 import type { LogRecord } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createWorktreeWatcher } from '../src/watcher/worktree-watcher.js';
-import type { ChangeSignal, WorktreeWatcher } from '../src/watcher/worktree-watcher.js';
+import type {
+  ChangeSignal,
+  WatchFactory,
+  WorktreeWatcher,
+} from '../src/watcher/worktree-watcher.js';
 
 /**
  * The watcher against a real repository, because everything it can get wrong is
@@ -77,6 +81,25 @@ describe('worktree watcher', () => {
     watcher.close();
     rmSync(base, { recursive: true, force: true });
   });
+
+  /**
+   * Watchers whose events this test drives directly.
+   *
+   * The paths below are platform-dependent — macOS goes quiet when a watched
+   * root is deleted where Linux reports ENOENT, and no platform produces an
+   * exhausted watch budget on demand — so the kernel boundary is stubbed.
+   */
+  const fakeWatchers = (): { factory: WatchFactory; emitters: EventEmitter[] } => {
+    const emitters: EventEmitter[] = [];
+    return {
+      emitters,
+      factory: () => {
+        const emitter = new EventEmitter();
+        emitters.push(emitter);
+        return Object.assign(emitter, { close: () => undefined }) as unknown as FSWatcher;
+      },
+    };
+  };
 
   const worktreeSignals = (): ChangeSignal[] => signals.filter((s) => s.kind === 'worktree');
   const refSignals = (): ChangeSignal[] => signals.filter((s) => s.kind === 'ref');
@@ -298,15 +321,11 @@ describe('worktree watcher', () => {
   });
 
   it('reports a change the platform could not name', async () => {
-    const emitters: EventEmitter[] = [];
+    const { factory, emitters } = fakeWatchers();
     const unnamed = createWorktreeWatcher({
       onSignal: (signal) => signals.push(signal),
       debounceMs: DEBOUNCE_MS,
-      watchFactory: () => {
-        const emitter = new EventEmitter();
-        emitters.push(emitter);
-        return Object.assign(emitter, { close: () => undefined }) as unknown as FSWatcher;
-      },
+      watchFactory: factory,
     });
 
     try {
@@ -322,6 +341,53 @@ describe('worktree watcher', () => {
       expect(worktreeSignals()[0]?.paths).toEqual([]);
     } finally {
       unnamed.close();
+    }
+  });
+
+  it('closes a watch quietly when its path disappears', async () => {
+    const { factory, emitters } = fakeWatchers();
+    const vanishing = createWorktreeWatcher({
+      onSignal: (signal) => signals.push(signal),
+      debounceMs: DEBOUNCE_MS,
+      pollIntervalMs: 30,
+      watchFactory: factory,
+    });
+
+    try {
+      vanishing.watch({ worktreePath: root, gitDir: join(root, '.git') });
+      const gone: NodeJS.ErrnoException = new Error('ENOENT: no such file or directory');
+      gone.code = 'ENOENT';
+      emitters[0]?.emit('error', gone);
+      await settle(150);
+
+      // A directory that is gone is not an OS refusal. Polling it would burn a
+      // timer forever on a worktree that is never coming back.
+      expect(vanishing.isDegraded(root)).toBe(false);
+      expect(signals).toEqual([]);
+    } finally {
+      vanishing.close();
+    }
+  });
+
+  it('degrades on an error that is not a missing path', async () => {
+    const { factory, emitters } = fakeWatchers();
+    const failing = createWorktreeWatcher({
+      onSignal: (signal) => signals.push(signal),
+      debounceMs: DEBOUNCE_MS,
+      pollIntervalMs: 30,
+      watchFactory: factory,
+    });
+
+    try {
+      failing.watch({ worktreePath: root, gitDir: join(root, '.git') });
+      const budget: NodeJS.ErrnoException = new Error('ENOSPC: watch limit reached');
+      budget.code = 'ENOSPC';
+      emitters[0]?.emit('error', budget);
+      await settle(150);
+
+      expect(failing.isDegraded(root)).toBe(true);
+    } finally {
+      failing.close();
     }
   });
 

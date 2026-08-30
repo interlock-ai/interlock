@@ -263,7 +263,7 @@ every task here and is not repeated per task.
   as the database; and `readEvents(since)` replays in ULID order across a
   restart.
 
-- [ ] **Watcher: filesystem and ref events**
+- [x] **Watcher: filesystem and ref events**
       **Files:** `packages/daemon/src/watcher/`
       **What:** debounced filesystem and git-ref signals, published as
       `worktree.changed`.

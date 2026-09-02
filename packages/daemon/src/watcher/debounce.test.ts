@@ -146,6 +146,21 @@ describe('createDebouncer', () => {
     expect(flushed).toEqual([['two', ['b.txt']]]);
   });
 
+  it('refuses a ceiling below its quiet period', () => {
+    // Every batch would flush at the ceiling and the quiet period would never
+    // apply — a combination that describes nothing, so it is loud rather than
+    // silently reinterpreted.
+    expect(() => createDebouncer({ waitMs: 100, maxWaitMs: 50, onFlush: () => undefined })).toThrow(
+      /ceiling is below/u,
+    );
+  });
+
+  it('accepts a ceiling equal to its quiet period', () => {
+    expect(() =>
+      createDebouncer({ waitMs: 100, maxWaitMs: 100, onFlush: () => undefined }),
+    ).not.toThrow();
+  });
+
   it('ignores a flush for a key with nothing pending', () => {
     const { debouncer, flushed } = collect();
 

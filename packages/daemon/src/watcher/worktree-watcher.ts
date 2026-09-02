@@ -19,7 +19,7 @@ import type { Debouncer } from './debounce.js';
  * That split is also what keeps this testable against a temp directory.
  */
 
-export type SignalKind = 'worktree' | 'ref';
+export type SignalKind = (typeof SIGNAL_KINDS)[number];
 
 export interface ChangeSignal {
   readonly kind: SignalKind;
@@ -96,6 +96,24 @@ const DEFAULT_POLL_INTERVAL_MS = 2_000;
  */
 const REF_FILES: ReadonlySet<string> = new Set(['HEAD', 'packed-refs']);
 
+export const SIGNAL_KINDS = ['worktree', 'ref'] as const;
+
+/**
+ * Identity of a debounce batch, encoded into its key.
+ *
+ * A NUL cannot appear in a path, so the key carries everything the flush needs
+ * and nothing has to be retained beside it — a lookup table here would outlive
+ * every target it described, two entries per worktree ever watched.
+ */
+function signalKey(kind: SignalKind, worktreePath: string): string {
+  return `${kind}\0${worktreePath}`;
+}
+
+function splitSignalKey(key: string): [SignalKind, string] {
+  const separator = key.indexOf('\0');
+  return [key.slice(0, separator) as SignalKind, key.slice(separator + 1)];
+}
+
 interface WatchedTarget {
   readonly target: WatchTarget;
   /** Canonical, so a signal always names the path git would report. */
@@ -112,31 +130,23 @@ export function createWorktreeWatcher(options: WorktreeWatcherOptions): Worktree
     options.watchFactory ??
     ((path, watchOptions) => watch(path, { recursive: watchOptions.recursive, persistent: true }));
   const targets = new Map<string, WatchedTarget>();
-  const keys = new Map<string, { kind: SignalKind; worktreePath: string }>();
 
   const debouncer: Debouncer = createDebouncer({
     waitMs: options.debounceMs ?? DEFAULT_DEBOUNCE_MS,
     maxWaitMs: options.maxDebounceMs ?? DEFAULT_MAX_DEBOUNCE_MS,
     onFlush: (key, values) => {
-      const identity = keys.get(key);
-      if (identity === undefined) return;
+      const [kind, worktreePath] = splitSignalKey(key);
       // The empty string is how an unnamed event is carried through the batch.
       // One of them makes the whole batch unnamed: reporting only the paths that
       // did have names would be narrower than the truth, and a consumer that
       // scoped a status to them would miss whatever the unnamed event was.
       const unnamed = values.includes('');
-      options.onSignal({
-        kind: identity.kind,
-        worktreePath: identity.worktreePath,
-        paths: unnamed ? [] : values,
-      });
+      options.onSignal({ kind, worktreePath, paths: unnamed ? [] : values });
     },
   });
 
   const push = (kind: SignalKind, worktreePath: string, value: string): void => {
-    const key = `${kind}\0${worktreePath}`;
-    keys.set(key, { kind, worktreePath });
-    debouncer.push(key, value);
+    debouncer.push(signalKey(kind, worktreePath), value);
   };
 
   return {
@@ -246,17 +256,13 @@ export function createWorktreeWatcher(options: WorktreeWatcherOptions): Worktree
       stopWatchers(entry);
       targets.delete(key);
       // Anything still batched names a worktree nobody is listening to now.
-      for (const kind of ['worktree', 'ref'] as const) {
-        debouncer.cancel(`${kind}\0${key}`);
-        keys.delete(`${kind}\0${key}`);
-      }
+      for (const kind of SIGNAL_KINDS) debouncer.cancel(signalKey(kind, key));
     },
 
     close(): void {
       for (const entry of targets.values()) stopWatchers(entry);
       targets.clear();
       debouncer.cancel();
-      keys.clear();
     },
 
     get watching(): readonly string[] {
@@ -335,8 +341,6 @@ function refDirsOf(target: WatchTarget, log: Logger): RefDir[] {
       log.warn('git directory not found; refs unwatched', { path: dir.path });
   }
   return present;
-
-  return dirs;
 }
 
 function watchTree(

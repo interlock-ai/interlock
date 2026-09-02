@@ -1,3 +1,5 @@
+import { InterlockError } from '@interlock/shared';
+
 /**
  * Per-key coalescing of filesystem noise.
  *
@@ -49,6 +51,15 @@ interface Batch {
 
 export function createDebouncer(options: DebounceOptions): Debouncer {
   const { waitMs, maxWaitMs, onFlush } = options;
+  // A ceiling below the quiet period describes nothing: every batch would flush
+  // at the ceiling and the quiet period would never apply. Refused rather than
+  // clamped, so the misconfiguration is loud instead of silently reinterpreted.
+  if (maxWaitMs !== undefined && maxWaitMs < waitMs) {
+    throw new InterlockError('CONFIG_INVALID', 'The debounce ceiling is below its quiet period', {
+      details: { waitMs, maxWaitMs },
+      remedy: 'Set maxWaitMs to at least waitMs, or leave it unset.',
+    });
+  }
   const batches = new Map<string, Batch>();
 
   const emit = (key: string): void => {
@@ -65,12 +76,7 @@ export function createDebouncer(options: DebounceOptions): Debouncer {
       if (existing === undefined) {
         batches.set(key, {
           values: new Set([value]),
-          // Clamped even on the first push: a ceiling below the quiet period
-          // would otherwise go unapplied until a second value arrived.
-          timer: setTimeout(
-            () => emit(key),
-            maxWaitMs === undefined ? waitMs : Math.min(waitMs, maxWaitMs),
-          ),
+          timer: setTimeout(() => emit(key), waitMs),
           firstPushedAt: Date.now(),
         });
         return;

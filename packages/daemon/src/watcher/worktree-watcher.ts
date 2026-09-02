@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync, watch } from 'node:fs';
 import type { FSWatcher } from 'node:fs';
-import { join, sep } from 'node:path';
+import { basename, join, sep } from 'node:path';
 import { InterlockError, pathIgnored, silentLogger } from '@interlock/shared';
 import type { Logger } from '@interlock/shared';
 import { createDebouncer } from './debounce.js';
@@ -118,12 +118,15 @@ export function createWorktreeWatcher(options: WorktreeWatcherOptions): Worktree
     onFlush: (key, values) => {
       const identity = keys.get(key);
       if (identity === undefined) return;
+      // The empty string is how an unnamed event is carried through the batch.
+      // One of them makes the whole batch unnamed: reporting only the paths that
+      // did have names would be narrower than the truth, and a consumer that
+      // scoped a status to them would miss whatever the unnamed event was.
+      const unnamed = values.includes('');
       options.onSignal({
         kind: identity.kind,
         worktreePath: identity.worktreePath,
-        // The empty string is how an unnamed event is carried through the
-        // batch; it is not a path anyone can act on.
-        paths: values.filter((value) => value !== ''),
+        paths: unnamed ? [] : values,
       });
     },
   });
@@ -140,6 +143,7 @@ export function createWorktreeWatcher(options: WorktreeWatcherOptions): Worktree
       if (targets.has(worktreePath)) return;
 
       const ignore = [...(target.ignore ?? []), ...gitignorePatterns(worktreePath, log)];
+      const rootName = basename(worktreePath);
       const entry: WatchedTarget = { target, worktreePath, watchers: [], poller: null };
       targets.set(worktreePath, entry);
 
@@ -169,7 +173,12 @@ export function createWorktreeWatcher(options: WorktreeWatcherOptions): Worktree
             worktreePath,
             (filename) => {
               const rel = normalise(filename);
-              if (rel === null) {
+              // A metadata change on the watched directory itself is reported
+              // as that directory's own name, which is indistinguishable from a
+              // child of the same name. Reported as unnamed rather than dropped:
+              // an entry really called that would otherwise be lost, and "ask
+              // git" costs a status where guessing costs a change.
+              if (rel === null || rel === rootName) {
                 push('worktree', worktreePath, '');
                 return;
               }
@@ -216,8 +225,10 @@ export function createWorktreeWatcher(options: WorktreeWatcherOptions): Worktree
       stopWatchers(entry);
       targets.delete(key);
       // Anything still batched names a worktree nobody is listening to now.
-      debouncer.cancel(`worktree\0${key}`);
-      debouncer.cancel(`ref\0${key}`);
+      for (const kind of ['worktree', 'ref'] as const) {
+        debouncer.cancel(`${kind}\0${key}`);
+        keys.delete(`${kind}\0${key}`);
+      }
     },
 
     close(): void {

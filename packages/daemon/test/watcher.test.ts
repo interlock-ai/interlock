@@ -1,9 +1,17 @@
 import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import type { FSWatcher } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { createLogger } from '@interlock/shared';
 import type { LogRecord } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -388,6 +396,66 @@ describe('worktree watcher', () => {
       expect(failing.isDegraded(root)).toBe(true);
     } finally {
       failing.close();
+    }
+  });
+
+  it('does not invent a path when the worktree root itself changes', async () => {
+    watcher.watch({ worktreePath: root, gitDir: join(root, '.git') });
+    await observe();
+
+    // Measured on macOS: a metadata change on the watched directory is reported
+    // as that directory's own name, which would otherwise reach the sweep as a
+    // file inside the worktree that does not exist.
+    utimesSync(root, new Date(), new Date());
+    await settle();
+
+    const rootName = basename(root);
+    expect(signals.every((signal) => !signal.paths.includes(rootName))).toBe(true);
+    for (const signal of worktreeSignals()) expect(signal.paths).toEqual([]);
+  });
+
+  it('treats the root’s own name as unnamed on every platform', async () => {
+    const { factory, emitters } = fakeWatchers();
+    const rooted = createWorktreeWatcher({
+      onSignal: (signal) => signals.push(signal),
+      debounceMs: DEBOUNCE_MS,
+      watchFactory: factory,
+    });
+
+    try {
+      rooted.watch({ worktreePath: root, gitDir: join(root, '.git') });
+      emitters[0]?.emit('change', 'change', basename(root));
+      await settle();
+
+      // Not dropped: a file really called that would be lost. Unnamed, so the
+      // sweep asks git instead of being told about a path that may not exist.
+      expect(worktreeSignals()).toHaveLength(1);
+      expect(worktreeSignals()[0]?.paths).toEqual([]);
+    } finally {
+      rooted.close();
+    }
+  });
+
+  it('reports a batch as unnamed when any event in it was', async () => {
+    const { factory, emitters } = fakeWatchers();
+    const mixed = createWorktreeWatcher({
+      onSignal: (signal) => signals.push(signal),
+      debounceMs: DEBOUNCE_MS,
+      watchFactory: factory,
+    });
+
+    try {
+      mixed.watch({ worktreePath: root, gitDir: join(root, '.git') });
+      emitters[0]?.emit('change', 'rename', 'src/a.txt');
+      emitters[0]?.emit('change', 'rename', null);
+      await settle();
+
+      expect(worktreeSignals()).toHaveLength(1);
+      // Reporting only `src/a.txt` would be narrower than the truth: a consumer
+      // scoping a status to it would miss whatever the unnamed event was.
+      expect(worktreeSignals()[0]?.paths).toEqual([]);
+    } finally {
+      mixed.close();
     }
   });
 

@@ -26,7 +26,12 @@ export interface DebounceOptions {
 }
 
 export interface Debouncer {
-  /** Record a value against a key, (re)starting its quiet period. */
+  /**
+   * Record a value against a key, (re)starting its quiet period.
+   *
+   * `onFlush` runs from a timer, so whatever it throws reaches the process
+   * rather than this caller.
+   */
   push(key: string, value: string): void;
   /** Flush one key now, or every key when no key is given. */
   flush(key?: string): void;
@@ -60,7 +65,12 @@ export function createDebouncer(options: DebounceOptions): Debouncer {
       if (existing === undefined) {
         batches.set(key, {
           values: new Set([value]),
-          timer: setTimeout(() => emit(key), waitMs),
+          // Clamped even on the first push: a ceiling below the quiet period
+          // would otherwise go unapplied until a second value arrived.
+          timer: setTimeout(
+            () => emit(key),
+            maxWaitMs === undefined ? waitMs : Math.min(waitMs, maxWaitMs),
+          ),
           firstPushedAt: Date.now(),
         });
         return;

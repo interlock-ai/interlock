@@ -102,6 +102,8 @@ interface WatchedTarget {
   readonly worktreePath: string;
   readonly watchers: FSWatcher[];
   poller: ReturnType<typeof setInterval> | null;
+  /** Re-read whenever the worktree's `.gitignore` changes. */
+  ignore: string[];
 }
 
 export function createWorktreeWatcher(options: WorktreeWatcherOptions): WorktreeWatcher {
@@ -142,14 +144,27 @@ export function createWorktreeWatcher(options: WorktreeWatcherOptions): Worktree
       const worktreePath = canonical(target.worktreePath);
       if (targets.has(worktreePath)) return;
 
-      const ignore = [...(target.ignore ?? []), ...gitignorePatterns(worktreePath, log)];
+      const readIgnore = (): string[] => [
+        ...(target.ignore ?? []),
+        ...gitignorePatterns(worktreePath, log),
+      ];
       const rootName = basename(worktreePath);
-      const entry: WatchedTarget = { target, worktreePath, watchers: [], poller: null };
+      const entry: WatchedTarget = {
+        target,
+        worktreePath,
+        watchers: [],
+        poller: null,
+        ignore: readIgnore(),
+      };
       targets.set(worktreePath, entry);
 
       const degrade = (reason: unknown): void => {
         // An OS watch limit is a property of the machine, not of the repository,
         // so this reports and keeps working rather than failing the target.
+        // Target-wide even when only one watcher failed, because a budget is
+        // exhausted machine-wide and the ones that succeeded are living on
+        // borrowed descriptors. Nothing re-arms it on its own: `unwatch` then
+        // `watch` is the way back, which a sweep does when it re-lists.
         log.warn('watch refused, falling back to polling', {
           worktreePath,
           reason: reason instanceof Error ? reason.message : String(reason),
@@ -183,9 +198,15 @@ export function createWorktreeWatcher(options: WorktreeWatcherOptions): Worktree
                 return;
               }
               // `.git` is watched deliberately and separately; from here it is
-              // index and object churn arriving on every command.
-              if (rel === '.git' || rel.startsWith('.git/')) return;
-              if (pathIgnored(rel, ignore)) return;
+              // index and object churn arriving on every command. Matched at
+              // any depth, not just the root: a submodule or a vendored
+              // repository has one too, and its churn is no more interesting.
+              if (rel.split('/').includes('.git')) return;
+              // Re-read before it is applied, so a repository that adds
+              // `node_modules` mid-session stops being watched there without a
+              // restart. The change itself still signals: the file is content.
+              if (rel === '.gitignore') entry.ignore = readIgnore();
+              if (pathIgnored(rel, entry.ignore)) return;
               push('worktree', worktreePath, rel);
             },
             degrade,
@@ -193,7 +214,7 @@ export function createWorktreeWatcher(options: WorktreeWatcherOptions): Worktree
           ),
         );
 
-        for (const dir of refDirsOf(target)) {
+        for (const dir of refDirsOf(target, log)) {
           entry.watchers.push(
             watchTree(
               watchFactory,
@@ -295,7 +316,7 @@ interface RefDir {
  * its own git dir and the common one — watching only the first misses every
  * commit, and watching only the second misses every checkout.
  */
-function refDirsOf(target: WatchTarget): RefDir[] {
+function refDirsOf(target: WatchTarget, log: Logger): RefDir[] {
   const dirs: RefDir[] = [{ path: target.gitDir, prefix: '', topLevelOnly: true }];
   const shared = target.commonDir ?? target.gitDir;
 
@@ -305,7 +326,17 @@ function refDirsOf(target: WatchTarget): RefDir[] {
   const refs = `${shared}${sep}refs`;
   if (existsSync(refs)) dirs.push({ path: refs, prefix: 'refs/', topLevelOnly: false });
 
-  return dirs.filter((dir) => existsSync(dir.path));
+  const present = dirs.filter((dir) => existsSync(dir.path));
+  for (const dir of dirs) {
+    // Reported rather than dropped in silence: the symptom of a git dir that is
+    // not there is ref signals that simply never arrive, which is
+    // indistinguishable from a quiet repository.
+    if (!present.includes(dir))
+      log.warn('git directory not found; refs unwatched', { path: dir.path });
+  }
+  return present;
+
+  return dirs;
 }
 
 function watchTree(

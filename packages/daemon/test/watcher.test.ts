@@ -186,6 +186,71 @@ describe('worktree watcher', () => {
     expect(worktreeSignals()).toEqual([]);
   });
 
+  it('honours a .gitignore directory line', async () => {
+    // The trailing slash is the commonest form there is, and `trimSlashes`
+    // running before the any-depth check is what makes it work. Without it
+    // every `dist/`-style line silently stops matching — the CPU-burn case.
+    writeFileSync(join(root, '.gitignore'), 'node_modules/\n');
+    mkdirSync(join(root, 'node_modules', 'pkg'), { recursive: true });
+    watcher.watch({ worktreePath: root, gitDir: join(root, '.git') });
+    await observe();
+
+    writeFileSync(join(root, 'node_modules', 'pkg', 'index.js'), 'x\n');
+    await settle();
+
+    expect(worktreeSignals()).toEqual([]);
+  });
+
+  it('re-reads .gitignore when it changes', async () => {
+    mkdirSync(join(root, 'generated'), { recursive: true });
+    watcher.watch({ worktreePath: root, gitDir: join(root, '.git') });
+    await observe();
+
+    writeFileSync(join(root, '.gitignore'), 'generated/\n');
+    await settle();
+    signals.length = 0;
+
+    writeFileSync(join(root, 'generated', 'out.js'), 'x\n');
+    await settle();
+
+    // A repository that starts ignoring a directory mid-session is honoured
+    // without a restart; the alternative is burning events until it is
+    // re-watched, which may be never.
+    expect(worktreeSignals()).toEqual([]);
+  });
+
+  it('says nothing about a vendored repository’s own git dir', async () => {
+    mkdirSync(join(root, 'vendor', 'dep', '.git', 'refs'), { recursive: true });
+    watcher.watch({ worktreePath: root, gitDir: join(root, '.git') });
+    await observe();
+
+    writeFileSync(join(root, 'vendor', 'dep', '.git', 'index'), 'x\n');
+    await settle();
+
+    // A submodule or vendored checkout has a git dir too, and its churn is no
+    // more interesting than the main one's.
+    expect(worktreeSignals()).toEqual([]);
+  });
+
+  it('keeps delivering from a subdirectory that was deleted and re-created', async () => {
+    watcher.watch({ worktreePath: root, gitDir: join(root, '.git') });
+    await observe();
+
+    rmSync(join(root, 'src'), { recursive: true, force: true });
+    await settle();
+    mkdirSync(join(root, 'src'), { recursive: true });
+    await settle();
+    signals.length = 0;
+
+    writeFileSync(join(root, 'src', 'reborn.txt'), 'x\n');
+    await settle();
+
+    // The classic recursive-watch hole: a re-created directory is a new inode,
+    // and a watcher that registered the old one goes deaf to it.
+    expect(worktreeSignals()).toHaveLength(1);
+    expect(worktreeSignals()[0]?.paths).toContain('src/reborn.txt');
+  });
+
   it('keeps watching everything when .gitignore uses negation', async () => {
     writeFileSync(join(root, '.gitignore'), 'build\n!build/keep.txt\n');
     mkdirSync(join(root, 'build'), { recursive: true });
@@ -205,14 +270,17 @@ describe('worktree watcher', () => {
     watcher.watch({ worktreePath: root, gitDir: join(root, '.git') });
     await observe();
 
-    // `git status` rewrites the index; that is not a change to the worktree.
-    git(root, 'status', '--porcelain');
+    // `git add` writes the index unconditionally, where a `status` only does so
+    // when its stat cache is stale — so this cannot pass by producing no event.
+    writeFileSync(join(root, 'staged.txt'), 'x\n');
+    git(root, 'add', 'staged.txt');
     await settle();
 
-    expect(worktreeSignals()).toEqual([]);
-    // Nor a ref change. The git dir is watched for `HEAD` and `packed-refs`
-    // only; index writes, object writes and lock files arrive on every command
-    // and say nothing about a branch.
+    expect(worktreeSignals()).toHaveLength(1);
+    expect(worktreeSignals()[0]?.paths).toContain('staged.txt');
+    // And no ref change. The git dir is watched for `HEAD` and `packed-refs`
+    // only; the index and its lock file arrive on every command and say nothing
+    // about a branch.
     expect(refSignals()).toEqual([]);
   });
 

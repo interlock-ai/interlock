@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGitRunner } from '@interlock/core';
@@ -269,6 +269,104 @@ describe('reconciliation sweep', () => {
     expect(await store.listBranchRefs(repo!.id)).toHaveLength(1);
   });
 
+  it('recognises a repository registered by a subdirectory', async () => {
+    const nested = join(root, 'src');
+    mkdirSync(nested, { recursive: true });
+
+    await sweep.reconcile(nested);
+    await sweep.reconcile(nested);
+
+    // `openUserRepo` resolves a subdirectory to the main worktree, which is what
+    // gets stored. Looking the argument up instead finds nothing every pass, so
+    // the repository is announced as new for as long as the daemon runs.
+    expect(of('repo.discovered')).toHaveLength(1);
+    expect(await store.listRepos()).toHaveLength(1);
+  });
+
+  it('recognises a repository registered by a symlink', async () => {
+    const link = join(base, 'link-to-repo');
+    symlinkSync(root, link);
+
+    await sweep.reconcile(link);
+    await sweep.reconcile(link);
+
+    expect(of('repo.discovered')).toHaveLength(1);
+    expect((await store.listRepos()).map((repo) => repo.rootPath)).toEqual([root]);
+  });
+
+  it('keeps the last good config for a repository registered by a subdirectory', async () => {
+    const nested = join(root, 'src');
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(root, '.interlock.json'), JSON.stringify({ ignoreBranches: ['release/*'] }));
+    await sweep.reconcile(nested);
+
+    writeFileSync(join(root, '.interlock.json'), '{ not json');
+    await expect(sweep.reconcile(nested)).resolves.toBeUndefined();
+
+    // The fallback needs a stored row to fall back to, so a lookup that never
+    // finds one degrades this from "warn and keep working" to "fail every pass".
+    expect((await store.listRepos())[0]?.config).toEqual({ ignoreBranches: ['release/*'] });
+  });
+
+  it('reports a branch again once it is removed from ignoreBranches', async () => {
+    writeFileSync(join(root, '.interlock.json'), JSON.stringify({ ignoreBranches: ['release/*'] }));
+    git(root, 'branch', 'release/1.0');
+    await sweep.reconcile(root);
+    events.length = 0;
+
+    writeFileSync(join(root, '.interlock.json'), JSON.stringify({ ignoreBranches: [] }));
+    await sweep.reconcile(root);
+
+    // The row was deleted when it began being ignored, so coming back is an
+    // appearance rather than an update.
+    expect(of('branch.appeared')).toHaveLength(1);
+    const [repo] = await store.listRepos();
+    expect((await store.listBranchRefs(repo!.id)).map((branch) => branch.name).sort()).toEqual([
+      'main',
+      'release/1.0',
+    ]);
+  });
+
+  it('runs one pass per repository at a time', async () => {
+    await sweep.reconcile(root);
+    events.length = 0;
+    git(root, 'branch', 'feature');
+
+    // The timer and a filesystem signal are two triggers on the same work. Both
+    // passes would read the stored branches before either wrote, see the branch
+    // as new, and announce it twice into an append-only log.
+    await Promise.all([sweep.reconcile(root), sweep.reconcile(root), sweep.reconcile(root)]);
+
+    expect(of('branch.appeared')).toHaveLength(1);
+  });
+
+  it('reports a branch that moved to another worktree', async () => {
+    git(root, 'branch', 'feature');
+    await sweep.reconcile(root);
+    events.length = 0;
+
+    const linked = join(base, 'wt-feature');
+    git(root, 'worktree', 'add', '-q', linked, 'feature');
+    await sweep.reconcile(root);
+
+    // The event cannot carry the new path, but a watcher holding a watch on the
+    // old one has to learn to re-read.
+    expect(of('branch.updated')).toHaveLength(1);
+  });
+
+  it('says nothing when only which files are dirty changed', async () => {
+    writeFileSync(join(root, 'a.txt'), 'edited\n');
+    await sweep.reconcile(root);
+    events.length = 0;
+
+    writeFileSync(join(root, 'b.txt'), 'another\n');
+    await sweep.reconcile(root);
+
+    // Still dirty, still the same head. Which files changed is the filesystem
+    // watcher's own signal, and repeating it here carries nothing new.
+    expect(of('branch.updated')).toEqual([]);
+  });
+
   it('looks a repository up by its unique path rather than scanning the table', async () => {
     const other = join(base, 'other');
     init(other);
@@ -281,7 +379,7 @@ describe('reconciliation sweep', () => {
     expect(await store.getRepoByPath(join(base, 'never-seen'))).toBeNull();
   });
 
-  it('reports a worktree that became unreadable as unknown, not as clean', async () => {
+  it('publishes the transition from readable to unreadable as unknown', async () => {
     const linked = join(base, 'wt-feature');
     git(root, 'worktree', 'add', '-q', '-b', 'feature', linked);
     await sweep.reconcile(root);
@@ -313,7 +411,7 @@ describe('reconciliation sweep', () => {
     expect((await store.listRepos()).map((repo) => repo.rootPath)).toEqual([healthy]);
   });
 
-  it('reports a worktree it cannot read as unknown rather than clean', async () => {
+  it('stores a first sighting of an unreadable worktree as unknown, not clean', async () => {
     const linked = join(base, 'wt-gone');
     git(root, 'worktree', 'add', '-q', '-b', 'gone', linked);
     git(root, 'worktree', 'lock', linked);

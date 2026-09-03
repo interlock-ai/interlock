@@ -355,53 +355,87 @@ describe('reconciliation sweep', () => {
   it('joins a pass started under another spelling of the same repository', async () => {
     const nested = join(root, 'src');
     mkdirSync(nested, { recursive: true });
-    await sweep.reconcile(root);
-    events.length = 0;
-    git(root, 'branch', 'feature');
 
-    const slow = createSweep({
-      store,
-      bus,
-      runner: {
-        run: async (repo, args, runOptions) => {
-          await new Promise((resolve) => setTimeout(resolve, 15));
-          return createGitRunner().run(repo, args, runOptions);
-        },
+    // Counted rather than inferred from the events. Whether two passes interleave
+    // depends on where they yield, and with git the only real yield point the
+    // second pass reaches the branch loop only after the first has left it — so
+    // an event count is the same either way and proves nothing.
+    let passes = 0;
+    // A proxy rather than a spread: the store is a class instance, so its
+    // methods live on the prototype and a spread copies none of them.
+    const counted = new Proxy(store, {
+      get(target, property, receiver) {
+        if (property === 'getRepoByPath') {
+          return (rootPath: string) => {
+            passes += 1;
+            return target.getRepoByPath(rootPath);
+          };
+        }
+        const value: unknown = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
       },
+    });
+    const joining = createSweep({
+      store: counted,
+      bus,
+      runner: createGitRunner(),
       dataDir: join(base, 'data'),
     });
 
     // The timer sweeps the configured path while a signal names the canonical
-    // worktree; keyed on the caller's spelling alone, both passes run and the
-    // branch is announced twice into an append-only log.
-    await Promise.all([slow.reconcile(nested), slow.reconcile(root)]);
+    // worktree. Keyed on the caller's spelling alone, both passes do the work.
+    await Promise.all([joining.reconcile(nested), joining.reconcile(root)]);
 
+    expect(passes).toBe(1);
+  });
+
+  it('releases every spelling it claimed, not just the caller’s', async () => {
+    const nested = join(root, 'src');
+    mkdirSync(nested, { recursive: true });
+    await sweep.reconcile(nested);
+    events.length = 0;
+
+    git(root, 'branch', 'feature');
+    await sweep.reconcile(root);
+
+    // The pass claimed both spellings. Releasing only the caller's leaves the
+    // canonical one holding a settled pass, so this sweep returns it, does no
+    // work, and the repository is frozen from here on.
     expect(of('branch.appeared')).toHaveLength(1);
   });
 
-  it('announces a branch once when both triggers fire together', async () => {
+  it('does the work once when both triggers fire together', async () => {
     await sweep.reconcile(root);
     events.length = 0;
     git(root, 'branch', 'feature');
 
-    // Every git call slowed, so the passes genuinely overlap rather than
-    // finishing one after another by accident of timing.
-    const slow = createSweep({
-      store,
-      bus,
-      runner: {
-        run: async (repo, args, runOptions) => {
-          await new Promise((resolve) => setTimeout(resolve, 15));
-          return createGitRunner().run(repo, args, runOptions);
-        },
+    // Counted, not inferred from the events. Slowing git does not make the
+    // passes overlap where it matters: git calls are the only real yield point,
+    // so a second pass reaches the branch loop only after the first has left it
+    // and the event count comes out the same whether the guard is there or not.
+    let passes = 0;
+    const counted = new Proxy(store, {
+      get(target, property, receiver) {
+        if (property === 'getRepoByPath') {
+          return (path: string) => {
+            passes += 1;
+            return target.getRepoByPath(path);
+          };
+        }
+        const value: unknown = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
       },
+    });
+    const guarded = createSweep({
+      store: counted,
+      bus,
+      runner: createGitRunner(),
       dataDir: join(base, 'data'),
     });
 
-    await Promise.all([slow.reconcile(root), slow.reconcile(root), slow.reconcile(root)]);
+    await Promise.all([guarded.reconcile(root), guarded.reconcile(root), guarded.reconcile(root)]);
 
-    // Both passes would otherwise read the stored branches before either wrote,
-    // see the branch as new, and announce it twice into an append-only log.
+    expect(passes).toBe(1);
     expect(of('branch.appeared')).toHaveLength(1);
   });
 

@@ -86,6 +86,15 @@ export interface Store {
    */
   upsertBranchRef(ref: BranchRef): Promise<BranchRef>;
   listBranchRefs(repoId: Repo['id']): Promise<BranchRef[]>;
+  /**
+   * Remove a branch that no longer exists, and with it — by cascade — its merge
+   * pairs and its change sets.
+   *
+   * Reconciliation is otherwise upsert-only, so without this a branch deleted
+   * after it was merged keeps its rows for good: `prune` deliberately keeps each
+   * branch's newest change set, so retention never reaches them either.
+   */
+  deleteBranchRef(id: BranchRef['id']): Promise<void>;
 
   upsertSession(session: AgentSession): Promise<void>;
   listSessions(repoId: Repo['id']): Promise<AgentSession[]>;
@@ -286,6 +295,7 @@ class SqliteStore implements Store {
     readonly upsertBranchRef: StatementSync;
     readonly branchRefById: StatementSync;
     readonly listBranchRefs: StatementSync;
+    readonly deleteBranchRef: StatementSync;
     readonly upsertSession: StatementSync;
     readonly listSessions: StatementSync;
     readonly upsertChangeSet: StatementSync;
@@ -341,6 +351,8 @@ class SqliteStore implements Store {
       listBranchRefs: db.prepare(
         `SELECT ${BRANCH_REF_COLUMNS} FROM branch_refs b WHERE b.repo_id = ? ORDER BY b.name`,
       ),
+
+      deleteBranchRef: db.prepare('DELETE FROM branch_refs WHERE id = ?'),
 
       upsertSession: db.prepare(`
         INSERT INTO agent_sessions (id, repo_id, kind, external_session_id, branch_ref_id, cwd, started_at, last_active_at, ended_at)
@@ -493,6 +505,12 @@ class SqliteStore implements Store {
 
   listBranchRefs(repoId: Repo['id']): Promise<BranchRef[]> {
     return settled(() => this.#statements.listBranchRefs.all(repoId).map(toBranchRef));
+  }
+
+  deleteBranchRef(id: BranchRef['id']): Promise<void> {
+    return settled(() => {
+      this.#statements.deleteBranchRef.run(id);
+    });
   }
 
   upsertSession(session: AgentSession): Promise<void> {

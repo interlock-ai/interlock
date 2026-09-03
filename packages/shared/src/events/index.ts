@@ -47,7 +47,12 @@ export interface BranchUpdated extends EventBase {
   readonly type: 'branch.updated';
   readonly branchRefId: BranchRefId;
   readonly headSha: string;
-  readonly dirty: boolean;
+  /**
+   * `null` when the worktree could not be read, which is not the same as
+   * clean. Folding the two together here would undo the distinction the store
+   * keeps, one layer further out and in a log that is never re-derived.
+   */
+  readonly dirty: boolean | null;
 }
 
 export interface BranchDisappeared extends EventBase {

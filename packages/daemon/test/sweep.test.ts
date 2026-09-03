@@ -356,23 +356,34 @@ describe('reconciliation sweep', () => {
     const nested = join(root, 'src');
     mkdirSync(nested, { recursive: true });
 
-    // Counted rather than inferred from the events. Whether two passes interleave
-    // depends on where they yield, and with git the only real yield point the
-    // second pass reaches the branch loop only after the first has left it — so
-    // an event count is the same either way and proves nothing.
+    // Counted, and the first pass is held at a known point rather than raced.
+    // Under `Promise.all` the canonical caller registers its own key first, so
+    // the claim never runs; it earns its keep only when the *other* spelling
+    // gets there first, which is the ordering this constructs.
     let passes = 0;
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     // A proxy rather than a spread: the store is a class instance, so its
     // methods live on the prototype and a spread copies none of them.
     const counted = new Proxy(store, {
       get(target, property, receiver) {
         if (property === 'getRepoByPath') {
-          return (rootPath: string) => {
+          return async (rootPath: string) => {
             passes += 1;
+            // Reached immediately after `openUserRepo` resolves, so by here the
+            // pass has learned the canonical root and claimed it — or has not.
+            if (passes === 1) await held;
             return target.getRepoByPath(rootPath);
           };
         }
         const value: unknown = Reflect.get(target, property, receiver);
-        return typeof value === 'function' ? value.bind(target) : value;
+        // `Function.bind` widens to `any`; the store's own types are what the
+        // sweep is checked against, so the cast stays inside this forwarder.
+        return typeof value === 'function'
+          ? (value as (...args: unknown[]) => unknown).bind(target)
+          : value;
       },
     });
     const joining = createSweep({
@@ -384,7 +395,11 @@ describe('reconciliation sweep', () => {
 
     // The timer sweeps the configured path while a signal names the canonical
     // worktree. Keyed on the caller's spelling alone, both passes do the work.
-    await Promise.all([joining.reconcile(nested), joining.reconcile(root)]);
+    const first = joining.reconcile(nested);
+    await Promise.resolve();
+    const second = joining.reconcile(root);
+    release();
+    await Promise.all([first, second]);
 
     expect(passes).toBe(1);
   });
@@ -423,7 +438,11 @@ describe('reconciliation sweep', () => {
           };
         }
         const value: unknown = Reflect.get(target, property, receiver);
-        return typeof value === 'function' ? value.bind(target) : value;
+        // `Function.bind` widens to `any`; the store's own types are what the
+        // sweep is checked against, so the cast stays inside this forwarder.
+        return typeof value === 'function'
+          ? (value as (...args: unknown[]) => unknown).bind(target)
+          : value;
       },
     });
     const guarded = createSweep({

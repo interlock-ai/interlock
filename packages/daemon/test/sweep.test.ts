@@ -327,16 +327,51 @@ describe('reconciliation sweep', () => {
     ]);
   });
 
-  it('runs one pass per repository at a time', async () => {
+  it('joins a pass already running for the same repository', async () => {
+    // Asserted on identity rather than on the events: whether concurrent passes
+    // actually interleave depends on how far apart their git calls land, so a
+    // count can be right by luck on a build where the guard is gone.
+    const first = sweep.reconcile(root);
+    const second = sweep.reconcile(root);
+
+    expect(second).toBe(first);
+    await first;
+  });
+
+  it('runs a repository again once its pass has finished', async () => {
+    await sweep.reconcile(root);
+    const later = sweep.reconcile(root);
+
+    // Joined only while in flight; an entry left behind would make every later
+    // sweep return the first pass's result and the repository would freeze.
+    expect(later).not.toBe(Promise.resolve());
+    await later;
+    expect(await store.listRepos()).toHaveLength(1);
+  });
+
+  it('announces a branch once when both triggers fire together', async () => {
     await sweep.reconcile(root);
     events.length = 0;
     git(root, 'branch', 'feature');
 
-    // The timer and a filesystem signal are two triggers on the same work. Both
-    // passes would read the stored branches before either wrote, see the branch
-    // as new, and announce it twice into an append-only log.
-    await Promise.all([sweep.reconcile(root), sweep.reconcile(root), sweep.reconcile(root)]);
+    // Every git call slowed, so the passes genuinely overlap rather than
+    // finishing one after another by accident of timing.
+    const slow = createSweep({
+      store,
+      bus,
+      runner: {
+        run: async (repo, args, runOptions) => {
+          await new Promise((resolve) => setTimeout(resolve, 15));
+          return createGitRunner().run(repo, args, runOptions);
+        },
+      },
+      dataDir: join(base, 'data'),
+    });
 
+    await Promise.all([slow.reconcile(root), slow.reconcile(root), slow.reconcile(root)]);
+
+    // Both passes would otherwise read the stored branches before either wrote,
+    // see the branch as new, and announce it twice into an append-only log.
     expect(of('branch.appeared')).toHaveLength(1);
   });
 

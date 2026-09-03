@@ -339,14 +339,44 @@ describe('reconciliation sweep', () => {
   });
 
   it('runs a repository again once its pass has finished', async () => {
-    await sweep.reconcile(root);
+    const first = sweep.reconcile(root);
+    await first;
     const later = sweep.reconcile(root);
 
-    // Joined only while in flight; an entry left behind would make every later
-    // sweep return the first pass's result and the repository would freeze.
-    expect(later).not.toBe(Promise.resolve());
+    // Compared against the pass that actually ran: `Promise.resolve()` mints a
+    // new instance every call, so comparing with one can never fail. Joined only
+    // while in flight — an entry left behind would hand every later sweep a
+    // settled pass and the repository would never be looked at again.
+    expect(later).not.toBe(first);
     await later;
     expect(await store.listRepos()).toHaveLength(1);
+  });
+
+  it('joins a pass started under another spelling of the same repository', async () => {
+    const nested = join(root, 'src');
+    mkdirSync(nested, { recursive: true });
+    await sweep.reconcile(root);
+    events.length = 0;
+    git(root, 'branch', 'feature');
+
+    const slow = createSweep({
+      store,
+      bus,
+      runner: {
+        run: async (repo, args, runOptions) => {
+          await new Promise((resolve) => setTimeout(resolve, 15));
+          return createGitRunner().run(repo, args, runOptions);
+        },
+      },
+      dataDir: join(base, 'data'),
+    });
+
+    // The timer sweeps the configured path while a signal names the canonical
+    // worktree; keyed on the caller's spelling alone, both passes run and the
+    // branch is announced twice into an append-only log.
+    await Promise.all([slow.reconcile(nested), slow.reconcile(root)]);
+
+    expect(of('branch.appeared')).toHaveLength(1);
   });
 
   it('announces a branch once when both triggers fire together', async () => {

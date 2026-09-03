@@ -151,8 +151,7 @@ export function createSweep(options: SweepOptions): Sweep {
     }
   };
 
-  const reconcileOne = async (rootPath: string): Promise<void> => {
-    const handle = await openUserRepo(rootPath, { runner });
+  const reconcileResolved = async (handle: UserRepo): Promise<void> => {
     // Looked up by the canonical root, not by what the caller passed.
     // `openUserRepo` resolves a subdirectory, a symlink or a linked worktree to
     // the main worktree, and that is what was stored — so looking up the
@@ -175,16 +174,53 @@ export function createSweep(options: SweepOptions): Sweep {
     await reconcileBranches(handle, repo);
   };
 
+  /**
+   * Begin a pass, claiming the repository under every spelling it is known by.
+   *
+   * Keyed on the caller's argument first, because that is the only thing
+   * available without asking git and a check that has to await cannot exclude a
+   * second caller. Once the canonical root is known the pass claims that too, so
+   * a later call spelling the repository differently joins rather than
+   * duplicating — and releases both, or a resolved pass would be handed to every
+   * sweep afterwards and the repository would never be looked at again.
+   */
+  const start = (rootPath: string): Promise<void> => {
+    const claimed = new Set([rootPath]);
+    // The pass registers itself under a key it only learns after it has begun,
+    // so it reaches its own handle through this rather than through a binding
+    // that does not exist yet. Assigned before the first `await` returns.
+    const self: { promise: Promise<void> | null } = { promise: null };
+
+    const body = async (): Promise<void> => {
+      const handle = await openUserRepo(rootPath, { runner });
+      if (handle.rootPath !== rootPath && self.promise !== null) {
+        // Only git can say that `/repo/src`, a symlink and `/repo` are one
+        // worktree, so a second spelling gets this far before it can be
+        // recognised. Join whoever claimed the canonical root first.
+        const running = inFlight.get(handle.rootPath);
+        if (running !== undefined) return running;
+        claimed.add(handle.rootPath);
+        inFlight.set(handle.rootPath, self.promise);
+      }
+      return reconcileResolved(handle);
+    };
+
+    const pass = body().finally(() => {
+      // Nothing else can hold these: a call naming any of them would have joined
+      // this pass rather than starting one. Both go, or a settled pass is handed
+      // to every later sweep and the repository is never looked at again.
+      for (const key of claimed) inFlight.delete(key);
+    });
+    self.promise = pass;
+    inFlight.set(rootPath, pass);
+    return pass;
+  };
+
   return {
     reconcile(rootPath: string): Promise<void> {
-      const running = inFlight.get(rootPath);
       // Joined rather than queued: a second pass asked for while one is running
       // would read the same git state and find nothing new to say.
-      if (running !== undefined) return running;
-
-      const pass = reconcileOne(rootPath).finally(() => inFlight.delete(rootPath));
-      inFlight.set(rootPath, pass);
-      return pass;
+      return inFlight.get(rootPath) ?? start(rootPath);
     },
 
     async all(rootPaths: readonly string[]): Promise<SweepOutcome> {

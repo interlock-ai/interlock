@@ -362,8 +362,12 @@ describe('reconciliation sweep', () => {
     // gets there first, which is the ordering this constructs.
     let passes = 0;
     let release = (): void => undefined;
+    let arrived = (): void => undefined;
     const held = new Promise<void>((resolve) => {
       release = resolve;
+    });
+    const reachedGate = new Promise<void>((resolve) => {
+      arrived = resolve;
     });
     // A proxy rather than a spread: the store is a class instance, so its
     // methods live on the prototype and a spread copies none of them.
@@ -374,7 +378,10 @@ describe('reconciliation sweep', () => {
             passes += 1;
             // Reached immediately after `openUserRepo` resolves, so by here the
             // pass has learned the canonical root and claimed it — or has not.
-            if (passes === 1) await held;
+            if (passes === 1) {
+              arrived();
+              await held;
+            }
             return target.getRepoByPath(rootPath);
           };
         }
@@ -396,7 +403,11 @@ describe('reconciliation sweep', () => {
     // The timer sweeps the configured path while a signal names the canonical
     // worktree. Keyed on the caller's spelling alone, both passes do the work.
     const first = joining.reconcile(nested);
-    await Promise.resolve();
+    // Waited on the gate, not on a microtask: `openUserRepo` runs real git, so a
+    // bare `await` leaves the first pass still inside it having claimed nothing
+    // — the second pass then registers the canonical key itself and the first
+    // joins that, so the count comes out right for the wrong reason.
+    await reachedGate;
     const second = joining.reconcile(root);
     release();
     await Promise.all([first, second]);

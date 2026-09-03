@@ -58,6 +58,15 @@ export interface BranchUpdated extends EventBase {
 export interface BranchDisappeared extends EventBase {
   readonly type: 'branch.disappeared';
   readonly branchRefId: BranchRefId;
+  /**
+   * Why it stopped being tracked.
+   *
+   * `deleted` — the branch is gone from the repository.
+   * `ignored` — it still exists, and the repository asked to be left alone
+   * about it. Without this the two are indistinguishable on replay, and a
+   * branch the user merely excluded reads as one that was destroyed.
+   */
+  readonly reason: 'deleted' | 'ignored';
 }
 
 export interface WorkingTreeChanged extends EventBase {

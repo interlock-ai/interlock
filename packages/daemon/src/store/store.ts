@@ -75,6 +75,8 @@ export interface Store {
    */
   upsertRepo(repo: Repo): Promise<Repo>;
   listRepos(): Promise<Repo[]>;
+  /** One indexed lookup on the unique key, for a sweep that asks per repository. */
+  getRepoByPath(rootPath: Repo['rootPath']): Promise<Repo | null>;
 
   /**
    * Insert or reconcile a branch, returning the stored row.
@@ -292,6 +294,7 @@ class SqliteStore implements Store {
   readonly #statements: {
     readonly upsertRepo: StatementSync;
     readonly listRepos: StatementSync;
+    readonly repoByPath: StatementSync;
     readonly upsertBranchRef: StatementSync;
     readonly branchRefById: StatementSync;
     readonly listBranchRefs: StatementSync;
@@ -336,6 +339,7 @@ class SqliteStore implements Store {
           last_seen_at   = excluded.last_seen_at
         RETURNING *`),
       listRepos: db.prepare('SELECT * FROM repos ORDER BY root_path'),
+      repoByPath: db.prepare('SELECT * FROM repos WHERE root_path = ?'),
 
       upsertBranchRef: db.prepare(`
         INSERT INTO branch_refs (id, repo_id, ref, name, head_sha, worktree_path, dirty, first_seen_at, updated_at)
@@ -494,6 +498,13 @@ class SqliteStore implements Store {
 
   listRepos(): Promise<Repo[]> {
     return settled(() => this.#statements.listRepos.all().map(toRepo));
+  }
+
+  getRepoByPath(rootPath: Repo['rootPath']): Promise<Repo | null> {
+    return settled(() => {
+      const row = this.#statements.repoByPath.get(rootPath);
+      return row === undefined ? null : toRepo(row);
+    });
   }
 
   upsertBranchRef(ref: BranchRef): Promise<BranchRef> {

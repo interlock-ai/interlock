@@ -1,6 +1,6 @@
 import { describeRepo, listBranchRefs, openUserRepo } from '@interlock/core';
-import type { GitRunner } from '@interlock/core';
-import { isInterlockError, silentLogger } from '@interlock/shared';
+import type { GitRunner, UserRepo } from '@interlock/core';
+import { isInterlockError, matchesGlob, silentLogger } from '@interlock/shared';
 import type { BranchRef, InterlockEvent, Logger, Repo } from '@interlock/shared';
 import type { EventBus } from '../bus/index.js';
 import type { Store } from '../store/index.js';
@@ -16,6 +16,12 @@ import type { Store } from '../store/index.js';
  * It runs periodically as well as on signals: filesystem events are lossy on
  * macOS, and a branch created by a command that touched nothing inside a
  * watched worktree produces no signal at all.
+ *
+ * A store write and its event are two steps with no transaction around them, so
+ * a failure between them can cost an announcement. That is a hole in the log
+ * rather than in the state: the store is reconciled against git on the next
+ * pass and never rebuilt from the log, so what is lost is traceability for one
+ * change, not the change itself.
  */
 
 export interface SweepOptions {
@@ -62,24 +68,22 @@ export function createSweep(options: SweepOptions): Sweep {
    * config: serving a stale one is silent and permanent, while a warning here is
    * loud and recoverable the moment the file is fixed.
    */
-  const describeOrKeep = async (rootPath: string, stored: Repo | undefined): Promise<Repo> => {
-    const repo = await openUserRepo(rootPath, { runner });
+  const describeOrKeep = async (handle: UserRepo, stored: Repo | null): Promise<Repo> => {
     try {
-      return await describeRepo(repo, { runner, dataDir });
+      return await describeRepo(handle, { runner, dataDir });
     } catch (error) {
-      if (!isInterlockError(error) || error.code !== 'CONFIG_INVALID' || stored === undefined) {
+      if (!isInterlockError(error) || error.code !== 'CONFIG_INVALID' || stored === null) {
         throw error;
       }
       log.warn('the repository override file is invalid; keeping the last good config', {
-        rootPath,
+        rootPath: handle.rootPath,
         reason: error.message,
       });
       return { ...stored, lastSeenAt: new Date().toISOString() };
     }
   };
 
-  const reconcileBranches = async (repo: Repo): Promise<void> => {
-    const handle = await openUserRepo(repo.rootPath, { runner });
+  const reconcileBranches = async (handle: UserRepo, repo: Repo): Promise<void> => {
     const observed = await listBranchRefs(handle, repo.id, {
       runner,
       ...(repo.config.ignoreBranches === undefined
@@ -118,25 +122,37 @@ export function createSweep(options: SweepOptions): Sweep {
       }
     }
 
+    const ignored = (name: string): boolean =>
+      (repo.config.ignoreBranches ?? []).some((pattern) => matchesGlob(name, pattern));
+
     for (const gone of remaining.values()) {
-      // The rows for its merge pairs and change sets go with it, by cascade.
-      await store.deleteBranchRef(gone.id);
+      // Published before the row goes. Either order can fail between the two
+      // steps, but only this one repeats itself: a delete that fails leaves the
+      // branch to be reported again next sweep, where an event that fails after
+      // the delete is a hole nothing will ever fill — the branch is absent from
+      // git and from the store, so no later pass can notice it left.
       await publish({
         type: 'branch.disappeared',
         repoId: repo.id,
         at: new Date().toISOString(),
         branchRefId: gone.id,
+        // A branch the repository asked to ignore still exists. Reported as
+        // deleted, a replay would read an exclusion as a destruction.
+        reason: ignored(gone.name) ? 'ignored' : 'deleted',
       });
+      // Its merge pairs and change sets go with it, by cascade.
+      await store.deleteBranchRef(gone.id);
     }
   };
 
   return {
     async reconcile(rootPath: string): Promise<void> {
-      const stored = (await store.listRepos()).find((repo) => repo.rootPath === rootPath);
-      const described = await describeOrKeep(rootPath, stored);
+      const handle = await openUserRepo(rootPath, { runner });
+      const stored = await store.getRepoByPath(rootPath);
+      const described = await describeOrKeep(handle, stored);
       const repo = await store.upsertRepo(described);
 
-      if (stored === undefined) {
+      if (stored === null) {
         await publish({
           type: 'repo.discovered',
           repoId: repo.id,
@@ -146,7 +162,7 @@ export function createSweep(options: SweepOptions): Sweep {
         });
       }
 
-      await reconcileBranches(repo);
+      await reconcileBranches(handle, repo);
     },
 
     async all(rootPaths: readonly string[]): Promise<SweepOutcome> {

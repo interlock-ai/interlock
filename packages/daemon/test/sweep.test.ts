@@ -177,7 +177,7 @@ describe('reconciliation sweep', () => {
     git(root, 'branch', '-D', 'feature');
     await sweep.reconcile(root);
 
-    expect(of('branch.disappeared')).toHaveLength(1);
+    expect(of('branch.disappeared')).toMatchObject([{ reason: 'deleted' }]);
     expect((await store.listBranchRefs(repo!.id)).map((branch) => branch.name)).toEqual(['main']);
     // Without the cascade these outlive the branch for good: `prune` keeps each
     // branch's newest change set, so retention never reaches them either.
@@ -212,7 +212,9 @@ describe('reconciliation sweep', () => {
     // Read once at first sighting, the stored config would be the last word and
     // a repository asking to be left alone would be watched until a restart.
     expect((await store.listBranchRefs(repo!.id)).map((branch) => branch.name)).toEqual(['main']);
-    expect(of('branch.disappeared')).toHaveLength(1);
+    // Still a branch in git — reported as deleted, a replay would read the
+    // repository's own exclusion as a destruction.
+    expect(of('branch.disappeared')).toMatchObject([{ reason: 'ignored' }]);
   });
 
   it('keeps the last good config when the override file becomes malformed', async () => {
@@ -245,6 +247,38 @@ describe('reconciliation sweep', () => {
     // Nothing was ever good here, so there is no last-good config to keep and
     // storing the defaults would watch what the file may have excluded.
     expect(await store.listRepos()).toEqual([]);
+  });
+
+  it('reports a disappearance before the row it describes is gone', async () => {
+    await sweep.reconcile(root);
+    git(root, 'branch', 'feature');
+    await sweep.reconcile(root);
+    const [repo] = await store.listRepos();
+
+    const seenWhilePublished: number[] = [];
+    bus.on('branch.disappeared', async () => {
+      // The branch is still stored at this point, so a failure here leaves it
+      // to be reported again rather than losing the event for good.
+      seenWhilePublished.push((await store.listBranchRefs(repo!.id)).length);
+    });
+
+    git(root, 'branch', '-D', 'feature');
+    await sweep.reconcile(root);
+
+    expect(seenWhilePublished).toEqual([2]);
+    expect(await store.listBranchRefs(repo!.id)).toHaveLength(1);
+  });
+
+  it('looks a repository up by its unique path rather than scanning the table', async () => {
+    const other = join(base, 'other');
+    init(other);
+    await sweep.all([root, other]);
+
+    // `all()` asks once per repository; a scan per ask is quadratic by
+    // construction on the path task 3 has to measure.
+    const looked = await store.getRepoByPath(root);
+    expect(looked?.rootPath).toBe(root);
+    expect(await store.getRepoByPath(join(base, 'never-seen'))).toBeNull();
   });
 
   it('reports a worktree that became unreadable as unknown, not as clean', async () => {

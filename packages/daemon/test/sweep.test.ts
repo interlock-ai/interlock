@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/bus/index.js';
 import { openStore } from '../src/store/index.js';
 import type { Store } from '../src/store/index.js';
+import { rejection } from './support/rejection.js';
 import { createSweep } from '../src/watcher/sweep.js';
 import type { Sweep } from '../src/watcher/sweep.js';
 
@@ -235,11 +236,34 @@ describe('reconciliation sweep', () => {
   it('refuses a first sighting whose override file is malformed', async () => {
     writeFileSync(join(root, '.interlock.json'), '{ not json');
 
-    await expect(sweep.reconcile(root)).rejects.toThrow();
+    // The code matters, not just that something threw: keeping a `stored` that
+    // does not exist yet produces a repo with no id, and the constraint
+    // violation that follows rejects too — for a reason nobody could act on.
+    const error = await rejection(sweep.reconcile(root));
+    expect(error.code).toBe('CONFIG_INVALID');
 
     // Nothing was ever good here, so there is no last-good config to keep and
     // storing the defaults would watch what the file may have excluded.
     expect(await store.listRepos()).toEqual([]);
+  });
+
+  it('reports a worktree that became unreadable as unknown, not as clean', async () => {
+    const linked = join(base, 'wt-feature');
+    git(root, 'worktree', 'add', '-q', '-b', 'feature', linked);
+    await sweep.reconcile(root);
+    events.length = 0;
+
+    // Locked, so git keeps listing it rather than treating it as prunable.
+    git(root, 'worktree', 'lock', linked);
+    rmSync(linked, { recursive: true, force: true });
+    await sweep.reconcile(root);
+
+    // Readable-and-clean to unreadable is a change, and it is the transition a
+    // flag folding `null` into `false` cannot see at all: it reads both as
+    // clean and publishes nothing.
+    const updated = of('branch.updated');
+    expect(updated).toHaveLength(1);
+    expect(updated[0]).toMatchObject({ dirty: null });
   });
 
   it('contains a failing repository to itself', async () => {

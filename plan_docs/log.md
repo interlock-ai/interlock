@@ -4,6 +4,14 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-09-04
+
+- **`BranchUpdated.dirty` could not say "unknown", and that had to change before the sweep could publish anything honest.** It was typed `boolean`, so an unreadable worktree would have been reported as clean — undoing one layer out the exact distinction the store schema was built to keep, in a log that is never re-derived. Widened to `boolean | null`. Nothing has persisted one of these events yet, so changing the wire format cost nothing; in a month it would have cost a migration.
+- **The store grew its deletion path here, where the task said it would be needed.** `deleteBranchRef` takes the branch's merge pairs and change sets with it by cascade, and a test pins that rather than trusting the schema — dropping `ON DELETE CASCADE` from `change_sets` leaves the suite green otherwise.
+- **Branches reconcile under the id the store returned, not the one just minted.** Every sighting mints a fresh ULID, so writing branches against the described repo rather than the stored one orphans every row on the foreign key. Mutation-pinned, because nothing about the code reads as wrong.
+- **The mid-session config re-read needed no mechanism at all** — `describeRepo` already re-reads `.interlock.json` on every call, so it works by construction. What needed writing was the failure path: a malformed file keeps the last good config, and only when there is one. A first sighting with a broken file is refused outright, because storing the defaults would watch what the file may have been excluding.
+- **14 mutations, 12 caught on the first pass, and both survivors were tests that passed for the wrong reason.** Folding `null` into `false` in the dirty flag survived because the only test for it asserted the _store_ held null — which the store's own suite already pinned — while nothing asserted the _event_ carried it. And "a first sighting with a malformed file is refused" asserted only that something threw: swallow the parse error and the repo goes to the store with no id, whose constraint violation rejects too, for a reason no caller could act on. The first is now a readable-to-unreadable transition, which a flag that cannot see `null` reports as no change at all; the second asserts the code.
+
 ## 2026-08-30
 
 - **`no-unreachable` was off, and the reason is a real gap rather than a config slip.** An unreachable `return` survived lint entirely: typescript-eslint's `eslint-recommended` turns the core rule off on the grounds that TypeScript checks it, and TypeScript only does when `allowUnreachableCode` is `false`, which was never set. Setting it in `tsconfig.base.json` catches the case at typecheck — which is where the toolchain expects the check to live, and where an editor shows it — rather than re-enabling a rule the preset deliberately disabled.

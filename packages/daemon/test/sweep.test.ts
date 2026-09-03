@@ -327,6 +327,67 @@ describe('reconciliation sweep', () => {
     ]);
   });
 
+  /**
+   * A sweep whose first pass parks immediately after `openUserRepo` resolves.
+   *
+   * That instant is the one that matters: the pass has learned the canonical
+   * root and has either claimed it or not. Holding it there makes the ordering
+   * exact, where awaiting a microtask leaves it still inside git having claimed
+   * nothing — and the second pass then registers the canonical key itself, so
+   * the count comes out right for the wrong reason.
+   */
+  const countingSweep = (): {
+    sweep: Sweep;
+    passes: () => number;
+    atGate: Promise<void>;
+    release: () => void;
+  } => {
+    let passes = 0;
+    let release = (): void => undefined;
+    let arrived = (): void => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const atGate = new Promise<void>((resolve) => {
+      arrived = resolve;
+    });
+
+    // A proxy rather than a spread: the store is a class instance, so its
+    // methods live on the prototype and a spread copies none of them.
+    const counted = new Proxy(store, {
+      get(target, property, receiver) {
+        if (property === 'getRepoByPath') {
+          return async (rootPath: string) => {
+            passes += 1;
+            if (passes === 1) {
+              arrived();
+              await held;
+            }
+            return target.getRepoByPath(rootPath);
+          };
+        }
+        const value: unknown = Reflect.get(target, property, receiver);
+        // `Function.bind` widens to `any`; the store's own types are what the
+        // sweep is checked against, so the cast stays inside this forwarder.
+        return typeof value === 'function'
+          ? (value as (...args: unknown[]) => unknown).bind(target)
+          : value;
+      },
+    });
+
+    return {
+      sweep: createSweep({
+        store: counted,
+        bus,
+        runner: createGitRunner(),
+        dataDir: join(base, 'data'),
+      }),
+      passes: () => passes,
+      atGate,
+      release,
+    };
+  };
+
   it('joins a pass already running for the same repository', async () => {
     // Asserted on identity rather than on the events: whether concurrent passes
     // actually interleave depends on how far apart their git calls land, so a
@@ -352,67 +413,37 @@ describe('reconciliation sweep', () => {
     expect(await store.listRepos()).toHaveLength(1);
   });
 
-  it('joins a pass started under another spelling of the same repository', async () => {
+  it('joins when the other spelling started first', async () => {
     const nested = join(root, 'src');
     mkdirSync(nested, { recursive: true });
+    const { sweep: joining, passes, atGate, release } = countingSweep();
 
-    // Counted, and the first pass is held at a known point rather than raced.
-    // Under `Promise.all` the canonical caller registers its own key first, so
-    // the claim never runs; it earns its keep only when the *other* spelling
-    // gets there first, which is the ordering this constructs.
-    let passes = 0;
-    let release = (): void => undefined;
-    let arrived = (): void => undefined;
-    const held = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const reachedGate = new Promise<void>((resolve) => {
-      arrived = resolve;
-    });
-    // A proxy rather than a spread: the store is a class instance, so its
-    // methods live on the prototype and a spread copies none of them.
-    const counted = new Proxy(store, {
-      get(target, property, receiver) {
-        if (property === 'getRepoByPath') {
-          return async (rootPath: string) => {
-            passes += 1;
-            // Reached immediately after `openUserRepo` resolves, so by here the
-            // pass has learned the canonical root and claimed it — or has not.
-            if (passes === 1) {
-              arrived();
-              await held;
-            }
-            return target.getRepoByPath(rootPath);
-          };
-        }
-        const value: unknown = Reflect.get(target, property, receiver);
-        // `Function.bind` widens to `any`; the store's own types are what the
-        // sweep is checked against, so the cast stays inside this forwarder.
-        return typeof value === 'function'
-          ? (value as (...args: unknown[]) => unknown).bind(target)
-          : value;
-      },
-    });
-    const joining = createSweep({
-      store: counted,
-      bus,
-      runner: createGitRunner(),
-      dataDir: join(base, 'data'),
-    });
-
-    // The timer sweeps the configured path while a signal names the canonical
-    // worktree. Keyed on the caller's spelling alone, both passes do the work.
+    // Non-canonical first: it must claim the canonical root, or the sweep that
+    // names the repository properly starts a second pass over the same work.
     const first = joining.reconcile(nested);
-    // Waited on the gate, not on a microtask: `openUserRepo` runs real git, so a
-    // bare `await` leaves the first pass still inside it having claimed nothing
-    // — the second pass then registers the canonical key itself and the first
-    // joins that, so the count comes out right for the wrong reason.
-    await reachedGate;
+    await atGate;
     const second = joining.reconcile(root);
     release();
     await Promise.all([first, second]);
 
-    expect(passes).toBe(1);
+    expect(passes()).toBe(1);
+  });
+
+  it('joins when the canonical spelling started first', async () => {
+    const nested = join(root, 'src');
+    mkdirSync(nested, { recursive: true });
+    const { sweep: joining, passes, atGate, release } = countingSweep();
+
+    // The mirror ordering, and it needs the other half of the guard: this pass
+    // only learns the two spellings are one repository after asking git, so it
+    // joins from inside its own body rather than at the door.
+    const first = joining.reconcile(root);
+    await atGate;
+    const second = joining.reconcile(nested);
+    release();
+    await Promise.all([first, second]);
+
+    expect(passes()).toBe(1);
   });
 
   it('releases every spelling it claimed, not just the caller’s', async () => {
@@ -434,38 +465,15 @@ describe('reconciliation sweep', () => {
     await sweep.reconcile(root);
     events.length = 0;
     git(root, 'branch', 'feature');
+    const { sweep: guarded, passes, atGate, release } = countingSweep();
 
-    // Counted, not inferred from the events. Slowing git does not make the
-    // passes overlap where it matters: git calls are the only real yield point,
-    // so a second pass reaches the branch loop only after the first has left it
-    // and the event count comes out the same whether the guard is there or not.
-    let passes = 0;
-    const counted = new Proxy(store, {
-      get(target, property, receiver) {
-        if (property === 'getRepoByPath') {
-          return (path: string) => {
-            passes += 1;
-            return target.getRepoByPath(path);
-          };
-        }
-        const value: unknown = Reflect.get(target, property, receiver);
-        // `Function.bind` widens to `any`; the store's own types are what the
-        // sweep is checked against, so the cast stays inside this forwarder.
-        return typeof value === 'function'
-          ? (value as (...args: unknown[]) => unknown).bind(target)
-          : value;
-      },
-    });
-    const guarded = createSweep({
-      store: counted,
-      bus,
-      runner: createGitRunner(),
-      dataDir: join(base, 'data'),
-    });
+    const first = guarded.reconcile(root);
+    await atGate;
+    const second = guarded.reconcile(root);
+    release();
+    await Promise.all([first, second]);
 
-    await Promise.all([guarded.reconcile(root), guarded.reconcile(root), guarded.reconcile(root)]);
-
-    expect(passes).toBe(1);
+    expect(passes()).toBe(1);
     expect(of('branch.appeared')).toHaveLength(1);
   });
 

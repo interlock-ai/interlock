@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGitRunner } from '@interlock/core';
 import { createLogger } from '@interlock/shared';
+import type { LogRecord } from '@interlock/shared';
 import type { InterlockEvent } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventBus } from '../src/bus/index.js';
@@ -233,21 +234,21 @@ describe('snapshot pipeline', () => {
     expect(unreadable[0]?.changeSetId).toBeNull();
   });
 
-  it('never deduplicates against a tree nobody read', async () => {
+  it('says a worktree is unreadable once, not once per pass', async () => {
     const linked = join(base, 'wt-flaky');
     git(root, 'worktree', 'add', '-q', '-b', 'flaky', linked);
     await sweep.reconcile(root);
 
     git(root, 'worktree', 'lock', linked);
     rmSync(linked, { recursive: true, force: true });
-    await sweep.reconcile(root);
     events.length = 0;
 
-    // Unknown twice running is still unknown twice: comparing it against the
-    // last good tree would suppress the next real change on a worktree that
-    // came back.
-    await sweep.reconcile(root);
+    for (let pass = 0; pass < 4; pass++) await sweep.reconcile(root);
 
+    // The transition is the news. A worktree on a volume that is gone would
+    // otherwise write hundreds of identical rows an hour into a log retention
+    // only trims by age — and `moved` in the sweep already reads null to null
+    // as no change, so publishing here every pass had the two disagreeing.
     expect(snapshots().filter((snapshot) => snapshot.treeOid === null)).toHaveLength(1);
   });
 
@@ -272,6 +273,33 @@ describe('snapshot pipeline', () => {
     const recovered = snapshots().filter((snapshot) => snapshot.treeOid !== null);
     expect(recovered).toHaveLength(1);
     expect(recovered[0]?.treeOid).toBe(before);
+  });
+
+  it('carries on when the default branch is not a ref this repository has', async () => {
+    // `origin/HEAD` naming a branch nobody fetched, which is ordinary in a
+    // worktree-heavy checkout.
+    git(root, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/trunk');
+    const records: LogRecord[] = [];
+    const tolerant = createSweep({
+      store,
+      bus,
+      runner: createGitRunner(),
+      dataDir: join(base, 'data'),
+      logger: createLogger('test', { level: 'trace', sink: (record) => records.push(record) }),
+    });
+
+    const outcome = await tolerant.all([root]);
+
+    // `mergeBase` raises for a revision it cannot resolve so a pair is never
+    // dropped in silence — but failing the whole repository on every pass, for
+    // ever, is the worse answer.
+    expect(outcome.failed).toEqual([]);
+    expect(snapshots()).toHaveLength(1);
+    expect(snapshots()[0]?.treeOid).not.toBeNull();
+    expect(snapshots()[0]?.changeSetId).toBeNull();
+    expect(records.map((record) => record.msg)).toContain(
+      'the default branch does not resolve; publishing without a diff',
+    );
   });
 
   it('says nothing about a branch that is not checked out anywhere', async () => {

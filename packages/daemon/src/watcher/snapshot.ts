@@ -1,6 +1,6 @@
 import { captureDirtyState, extractChangeSet, mergeBase } from '@interlock/core';
 import type { GitRunner, UserRepo } from '@interlock/core';
-import { silentLogger, ulid } from '@interlock/shared';
+import { isInterlockError, silentLogger, ulid } from '@interlock/shared';
 import type { BranchRef, ChangeSetId, Logger, Repo, SnapshotId } from '@interlock/shared';
 import type { EventBus } from '../bus/index.js';
 import type { Store } from '../store/index.js';
@@ -67,6 +67,23 @@ export interface SnapshotPipeline {
  */
 const DEFAULT_RECAPTURE_AFTER_MS = 60_000;
 
+/**
+ * What was last said about a worktree.
+ *
+ * `unknown` is a state that was published rather than the absence of one: it is
+ * what keeps an unreadable worktree from being announced again on every pass,
+ * and what makes the next readable pass an announcement rather than a repeat.
+ */
+type LastPublished =
+  | { readonly kind: 'unknown' }
+  | {
+      readonly kind: 'tree';
+      readonly treeOid: string;
+      readonly snapshotId: SnapshotId;
+      readonly at: number;
+      readonly changed: boolean;
+    };
+
 export function createSnapshotPipeline(options: SnapshotPipelineOptions): SnapshotPipeline {
   const log = (options.logger ?? silentLogger).child('snapshot');
   const { store, bus, runner } = options;
@@ -78,10 +95,7 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
    * what is on disk, and a branch that moves to another checkout is looking at
    * different files even where its head has not moved.
    */
-  const lastSeen = new Map<
-    string,
-    { treeOid: string; snapshotId: SnapshotId; at: number; changed: boolean }
-  >();
+  const lastSeen = new Map<string, LastPublished>();
   const recaptureAfterMs = options.recaptureAfterMs ?? DEFAULT_RECAPTURE_AFTER_MS;
   const now = options.now ?? Date.now;
 
@@ -89,27 +103,37 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
     async capture(handle: UserRepo, repo: Repo, branch: BranchRef): Promise<void> {
       if (branch.worktreePath === null) return;
 
+      const previous = lastSeen.get(branch.worktreePath);
+
       if (branch.dirty === null) {
-        // Unknown, not unchanged. Published every time rather than compared:
-        // there is no identity to compare, and silence here would be read as
-        // "nothing changed" about a worktree nobody could read.
-        lastSeen.delete(branch.worktreePath);
+        // The transition is the news, not the state. Downstream already knows
+        // this worktree is unknown, and saying so again every pass writes
+        // hundreds of identical rows an hour into a log that retention only
+        // trims by age. `moved` in the sweep reads null to null as no change
+        // for the same reason, and the two must not disagree about it.
+        if (previous?.kind === 'unknown') return;
+        lastSeen.set(branch.worktreePath, { kind: 'unknown' });
         await publish(branch, null, null, 0);
         return;
       }
 
-      const previous = lastSeen.get(branch.worktreePath);
       // Nothing said this worktree moved. Hashing it anyway is the whole idle
       // cost of the daemon, and it buys only the changes the filesystem failed
       // to report — which the ceiling still catches. A worktree with no entry
       // has never been hashed, so it is hashed whatever anyone reported.
-      if (previous !== undefined && !previous.changed && now() - previous.at < recaptureAfterMs) {
+      // An entry saying `unknown` falls through to the hash, so a worktree that
+      // came back is announced now rather than at the ceiling.
+      if (
+        previous?.kind === 'tree' &&
+        !previous.changed &&
+        now() - previous.at < recaptureAfterMs
+      ) {
         await rememberOn(branch, previous.snapshotId);
         return;
       }
 
       const snapshot = await captureDirtyState(branch.worktreePath, handle, { runner });
-      if (previous?.treeOid === snapshot.treeOid) {
+      if (previous?.kind === 'tree' && previous.treeOid === snapshot.treeOid) {
         // Same content, so the clock restarts: without this the ceiling stays
         // expired and every later pass hashes the worktree again.
         lastSeen.set(branch.worktreePath, { ...previous, at: now(), changed: false });
@@ -121,7 +145,7 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
       }
 
       const snapshotId = ulid<SnapshotId>();
-      const base = await mergeBase(handle, branch.headSha, repo.defaultBranch, { runner });
+      const base = await baseOrNone(handle, repo, branch);
       if (base === null) {
         // Two histories with no common ancestor have no diff to speak of, and
         // an empty one would read as "this branch changed nothing".
@@ -129,6 +153,7 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
           branch: branch.name,
         });
         lastSeen.set(branch.worktreePath, {
+          kind: 'tree',
           treeOid: snapshot.treeOid,
           snapshotId,
           at: now(),
@@ -145,6 +170,7 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
       });
       await store.upsertChangeSet(changeSet);
       lastSeen.set(branch.worktreePath, {
+        kind: 'tree',
         treeOid: snapshot.treeOid,
         snapshotId,
         at: now(),
@@ -159,13 +185,41 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
       // Recorded on the entry rather than beside it: a worktree with no entry
       // is hashed regardless, so a mark for one would be state that only ever
       // needed cleaning up.
-      if (previous !== undefined) lastSeen.set(worktreePath, { ...previous, changed: true });
+      if (previous?.kind === 'tree') lastSeen.set(worktreePath, { ...previous, changed: true });
     },
 
     forget(worktreePath: string): void {
       lastSeen.delete(worktreePath);
     },
   };
+
+  /**
+   * The merge base, or `null` where the default branch is not a ref this
+   * repository has.
+   *
+   * `mergeBase` raises rather than answering `null` for a revision it cannot
+   * resolve, so a pair is never dropped in silence — but the default branch is
+   * a guess: `origin/HEAD` can name a branch nobody fetched, and a detached
+   * head falls back to `main` whether or not one exists. Failing the whole
+   * repository on every pass for that is the worse answer, and this one is not
+   * silent: the snapshot says it has no diff and the reason is logged.
+   */
+  async function baseOrNone(
+    handle: UserRepo,
+    repo: Repo,
+    branch: BranchRef,
+  ): Promise<string | null> {
+    try {
+      return await mergeBase(handle, branch.headSha, repo.defaultBranch, { runner });
+    } catch (error) {
+      if (!isInterlockError(error) || error.code !== 'GIT_COMMAND_FAILED') throw error;
+      log.warn('the default branch does not resolve; publishing without a diff', {
+        defaultBranch: repo.defaultBranch,
+        branch: branch.name,
+      });
+      return null;
+    }
+  }
 
   /** Record which snapshot the branch's uncommitted work belongs to. */
   async function rememberOn(branch: BranchRef, snapshotId: SnapshotId): Promise<void> {

@@ -4,6 +4,12 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-09-05 — two review findings, both real
+
+- **An unreadable worktree was announced on every pass, for ever.** The `dirty === null` path published unconditionally: a worktree on an unmounted volume writes roughly seven hundred identical rows an hour into a log retention only trims by age. The comment justified the _first_ one — silence would read as "nothing changed" — and that argument covers the transition, not the repetition. Worse, `moved` in the sweep already treats null to null as no change, so two modules held opposite answers about the same state. What was last said about a worktree is now a value, `unknown` or a tree, and only a change to it is published.
+- **A test encoded that bug and had to be rewritten**, per hard rule 5 rather than patched around: it asserted "unknown twice running is still unknown twice", which is precisely the flooding. The property worth keeping — that a worktree coming back is announced even when its content is unchanged — was already covered by its own test.
+- **One branch with an unresolvable default branch failed the entire repository, every pass.** `resolveDefaultBranch` guesses: `origin/HEAD` can name a branch nobody fetched, and a detached head falls back to `main` whether one exists or not. `mergeBase` raises rather than answering null for a revision it cannot resolve — deliberately, so a pair is never dropped in silence — and that raise propagated out of the branch loop, so `all()` marked the repository failed on every pass and it was never reconciled again. Reproduced before fixing: `reconcile THREW: git merge-base failed`. It is now a snapshot with no diff and a warning naming the branch, which is not silent and does not cost the repository.
+
 ## 2026-09-05 — the watcher's numbers
 
 Measured on this laptop with `pnpm exec tsx scripts/watcher-bench.ts`: 10,000 files, three worktrees, a 5s sweep, 60s of continuous rewriting. The machine was not quiet — the baseline sat at 5–7% — so every CPU figure is a difference against a baseline run of the same workload with the watcher off, and the noise floor is roughly ±3%.

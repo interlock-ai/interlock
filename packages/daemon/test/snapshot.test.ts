@@ -302,6 +302,28 @@ describe('snapshot pipeline', () => {
     );
   });
 
+  it('still fails on a merge-base error that is not a missing ref', async () => {
+    const real = createGitRunner();
+    const broken = createSweep({
+      store,
+      bus,
+      dataDir: join(base, 'data'),
+      runner: {
+        run: (repo, args, runOptions) => {
+          if (args[0] === 'merge-base') throw new Error('the runner itself broke');
+          return real.run(repo, args, runOptions);
+        },
+      },
+    });
+
+    const outcome = await broken.all([root]);
+
+    // Only a revision git cannot resolve is turned into "no diff". Swallowing
+    // everything would hide a broken runner behind a snapshot that merely
+    // reports having nothing to say.
+    expect(outcome.failed).toEqual([root]);
+  });
+
   it('says nothing about a branch that is not checked out anywhere', async () => {
     git(root, 'branch', 'feature');
     await sweep.reconcile(root);

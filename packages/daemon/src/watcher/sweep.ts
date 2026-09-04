@@ -32,6 +32,8 @@ export interface SweepOptions {
   /** Root of Interlock's data dir; shadow paths are derived from it. */
   readonly dataDir: string;
   readonly logger?: Logger;
+  /** Passed through to the snapshot pipeline; see its own option. */
+  readonly recaptureAfterMs?: number;
 }
 
 export interface SweepOutcome {
@@ -50,6 +52,14 @@ export interface Sweep {
   reconcile(rootPath: string): Promise<void>;
   /** Reconcile every repository, containing a failure to the one it came from. */
   all(rootPaths: readonly string[]): Promise<SweepOutcome>;
+  /**
+   * Report that a worktree changed on disk, so the next pass hashes it.
+   *
+   * A pass that runs on a timer reconciles refs and branches cheaply; hashing
+   * every worktree it sees is what the daemon's idle cost is made of. This is
+   * how a filesystem signal says which one is worth the walk.
+   */
+  markChanged(worktreePath: string): void;
 }
 
 export function createSweep(options: SweepOptions): Sweep {
@@ -60,6 +70,9 @@ export function createSweep(options: SweepOptions): Sweep {
     bus,
     runner,
     ...(options.logger === undefined ? {} : { logger: options.logger }),
+    ...(options.recaptureAfterMs === undefined
+      ? {}
+      : { recaptureAfterMs: options.recaptureAfterMs }),
   });
   /**
    * One pass per repository at a time.
@@ -234,6 +247,10 @@ export function createSweep(options: SweepOptions): Sweep {
       // Joined rather than queued: a second pass asked for while one is running
       // would read the same git state and find nothing new to say.
       return inFlight.get(rootPath) ?? start(rootPath);
+    },
+
+    markChanged(worktreePath: string): void {
+      snapshots.markChanged(worktreePath);
     },
 
     async all(rootPaths: readonly string[]): Promise<SweepOutcome> {

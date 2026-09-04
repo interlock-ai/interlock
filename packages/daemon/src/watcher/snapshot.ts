@@ -23,6 +23,16 @@ export interface SnapshotPipelineOptions {
   readonly bus: EventBus;
   readonly runner: GitRunner;
   readonly logger?: Logger;
+  /**
+   * How long a worktree may go unhashed while nothing reports it changing.
+   *
+   * Filesystem events are lossy, so a signal arriving is proof that something
+   * happened and no signal arriving is not proof that nothing did. This is the
+   * safety net for the second case, and its cost is one hash per worktree per
+   * interval — measured at roughly half a second for ten thousand files, which
+   * is what makes it a ceiling rather than a cadence.
+   */
+  readonly recaptureAfterMs?: number;
 }
 
 export interface SnapshotPipeline {
@@ -34,9 +44,26 @@ export interface SnapshotPipeline {
    * `branch.updated`.
    */
   capture(handle: UserRepo, repo: Repo, branch: BranchRef): Promise<void>;
+  /**
+   * Record that something on disk changed under this worktree.
+   *
+   * Hashing a worktree costs a walk over every file in it, so a pass that runs
+   * on a timer must not do it for worktrees nothing reported. A marked one is
+   * hashed on the next pass; an unmarked one waits for the ceiling.
+   */
+  markChanged(worktreePath: string): void;
   /** Drop a worktree's remembered identity, so the next capture is published. */
   forget(worktreePath: string): void;
 }
+
+/**
+ * How long a worktree may go unhashed with nothing reporting a change.
+ *
+ * Long enough that the periodic cost is a rounding error, short enough that a
+ * filesystem event the platform dropped is noticed while the work is still in
+ * progress rather than after it lands.
+ */
+const DEFAULT_RECAPTURE_AFTER_MS = 60_000;
 
 export function createSnapshotPipeline(options: SnapshotPipelineOptions): SnapshotPipeline {
   const log = (options.logger ?? silentLogger).child('snapshot');
@@ -49,7 +76,9 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
    * what is on disk, and a branch that moves to another checkout is looking at
    * different files even where its head has not moved.
    */
-  const lastSeen = new Map<string, { treeOid: string; snapshotId: SnapshotId }>();
+  const lastSeen = new Map<string, { treeOid: string; snapshotId: SnapshotId; at: number }>();
+  const changed = new Set<string>();
+  const recaptureAfterMs = options.recaptureAfterMs ?? DEFAULT_RECAPTURE_AFTER_MS;
 
   return {
     async capture(handle: UserRepo, repo: Repo, branch: BranchRef): Promise<void> {
@@ -64,9 +93,23 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
         return;
       }
 
-      const snapshot = await captureDirtyState(branch.worktreePath, handle, { runner });
       const previous = lastSeen.get(branch.worktreePath);
+      if (previous !== undefined && !changed.has(branch.worktreePath)) {
+        // Nothing said this worktree moved. Hashing it anyway is the whole idle
+        // cost of the daemon, and it buys only the changes the filesystem
+        // failed to report — which the ceiling below still catches.
+        if (Date.now() - previous.at < recaptureAfterMs) {
+          await rememberOn(branch, previous.snapshotId);
+          return;
+        }
+      }
+      changed.delete(branch.worktreePath);
+
+      const snapshot = await captureDirtyState(branch.worktreePath, handle, { runner });
       if (previous?.treeOid === snapshot.treeOid) {
+        // Same content, so the clock restarts: without this the ceiling stays
+        // expired and every later pass hashes the worktree again.
+        lastSeen.set(branch.worktreePath, { ...previous, at: Date.now() });
         // The row still has to name the snapshot this content belongs to; the
         // sweep re-lists every branch with a null id and would otherwise leave
         // `contentIdentity` reading two different dirty states as one.
@@ -82,7 +125,11 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
         log.debug('no merge base; publishing the tree without a diff', {
           branch: branch.name,
         });
-        lastSeen.set(branch.worktreePath, { treeOid: snapshot.treeOid, snapshotId });
+        lastSeen.set(branch.worktreePath, {
+          treeOid: snapshot.treeOid,
+          snapshotId,
+          at: Date.now(),
+        });
         await rememberOn(branch, snapshotId);
         await publish(branch, snapshot.treeOid, null, 0);
         return;
@@ -93,13 +140,18 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
         snapshot: { id: snapshotId, treeOid: snapshot.treeOid },
       });
       await store.upsertChangeSet(changeSet);
-      lastSeen.set(branch.worktreePath, { treeOid: snapshot.treeOid, snapshotId });
+      lastSeen.set(branch.worktreePath, { treeOid: snapshot.treeOid, snapshotId, at: Date.now() });
       await rememberOn(branch, snapshotId);
       await publish(branch, snapshot.treeOid, changeSet.id, changeSet.files.length);
     },
 
+    markChanged(worktreePath: string): void {
+      changed.add(worktreePath);
+    },
+
     forget(worktreePath: string): void {
       lastSeen.delete(worktreePath);
+      changed.delete(worktreePath);
     },
   };
 

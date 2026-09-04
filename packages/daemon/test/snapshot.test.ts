@@ -79,11 +79,46 @@ describe('snapshot pipeline', () => {
     events.length = 0;
 
     // What an editor does on save, and what an agent does when it rewrites a
-    // file it did not really change: same bytes, new mtime.
+    // file it did not really change: same bytes, new mtime. The signal arrives
+    // and is believed — the hash is what disagrees with it.
     writeFileSync(join(root, 'a.txt'), 'a\n');
+    sweep.markChanged(root);
     await sweep.reconcile(root);
 
     expect(snapshots()).toEqual([]);
+  });
+
+  it('does not hash a worktree nothing reported changing', async () => {
+    await sweep.reconcile(root);
+    events.length = 0;
+
+    // The edit is real, but no signal named this worktree. Hashing every one on
+    // every timed pass is the whole of the daemon's idle cost — measured at
+    // about half a second per ten thousand files — and it buys only the changes
+    // the filesystem failed to report, which the ceiling catches instead.
+    writeFileSync(join(root, 'a.txt'), 'edited\n');
+    await sweep.reconcile(root);
+
+    expect(snapshots()).toEqual([]);
+  });
+
+  it('hashes anyway once the ceiling has passed', async () => {
+    const impatient = createSweep({
+      store,
+      bus,
+      runner: createGitRunner(),
+      dataDir: join(base, 'data'),
+      recaptureAfterMs: 0,
+    });
+    await impatient.reconcile(root);
+    events.length = 0;
+
+    // A filesystem event the platform dropped leaves nothing to mark, so the
+    // ceiling is the only thing that ever notices.
+    writeFileSync(join(root, 'a.txt'), 'edited\n');
+    await impatient.reconcile(root);
+
+    expect(snapshots()).toHaveLength(1);
   });
 
   it('publishes exactly one snapshot for a real edit', async () => {
@@ -92,6 +127,7 @@ describe('snapshot pipeline', () => {
     events.length = 0;
 
     writeFileSync(join(root, 'a.txt'), 'edited\n');
+    sweep.markChanged(root);
     await sweep.reconcile(root);
 
     expect(snapshots()).toHaveLength(1);
@@ -106,6 +142,7 @@ describe('snapshot pipeline', () => {
     // Never added, never committed — the whole point of hashing the worktree
     // rather than reading the branch head.
     writeFileSync(join(root, 'untracked.txt'), 'new\n');
+    sweep.markChanged(root);
     await sweep.reconcile(root);
 
     expect(snapshots()).toHaveLength(1);

@@ -4,6 +4,20 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-09-05 — the watcher's numbers
+
+Measured on this laptop with `pnpm exec tsx scripts/watcher-bench.ts`: 10,000 files, three worktrees, a 5s sweep, 60s of continuous rewriting. The machine was not quiet — the baseline sat at 5–7% — so every CPU figure is a difference against a baseline run of the same workload with the watcher off, and the noise floor is roughly ±3%.
+
+- **idle** — one pass over an unchanged repository costs **504ms**, of which almost all is one `git status` per worktree. At the 5s cadence the benchmark used, that is **0.68% of this ten-core machine** and about 10% of one core. Meeting 2% _of one core_ needs 25s between passes; against a machine-wide reading the budget is already met. The budget does not say which, and the two answers differ by an order of magnitude — worth settling before the composition picks a cadence.
+- **active** — **9.5%** machine-wide while three worktrees are rewritten continuously, with per-change latency **p50 1881ms, p95 2424ms** over 87 samples.
+
+- **The latency is the debounce, not the work.** Writes land every 200ms against a 250ms quiet period, so no batch ever goes quiet and every one runs to the 2s ceiling. p50 sitting just under it says the pipeline adds tens of milliseconds to a wait that the constant decides. M2's budget should be read as "the ceiling, plus a little", and lowering the ceiling moves it directly.
+- **Measured the wrong thing twice before measuring the right one.** Timing from the newest write reported 117ms — how stale a snapshot is when it lands, not how long a change waited; it is timed from the oldest unanswered write now. And sampling CPU could not see the idle cost at all: at a 30s cadence the difference came out _negative_, because the watcher's cost is below what a machine running anything else can resolve. Timing a pass directly is precise and needs no quiet machine.
+- **The measurement changed the design.** A pass hashed every worktree it saw, costing **1442ms**, which needs a 72s cadence to fit 2% of a core — no sane interval. The task's own wording says a snapshot follows _a debounce_, so hashing is now driven by a filesystem signal naming the worktree, with a 60s ceiling for the events macOS drops. That is what took a pass from 1442ms to 504ms.
+- **Decided, with the numbers in hand: no per-`status` timeout below the runner's 30s default.** A `status` on ten thousand files measures about 150ms, so the default is two hundred times the observed cost. A shorter bound would only ever fire on something genuinely pathological, and the failure it risks — a slow but working worktree reported unreadable — is the worse one.
+- **`changeset.computed` is gone.** Declared, never published, never consumed, and it would have been a second name for the moment `branch.snapshot` records, carrying strictly less: no tree identity, which is the whole point.
+- **The pipeline fills `DirtyState.snapshotId`,** which nothing did before — discovery always wrote `null`, so `contentIdentity` collapsed to the head alone and two different uncommitted states of one commit read as identical content. It is written on a deduplicated pass too, from the cache, because the sweep re-lists with `null` every time.
+
 ## 2026-09-05
 
 - **Found and fixed a shipped bug: an unreadable worktree was reported clean.** `git worktree list --porcelain` prints `prunable gitdir file points to non-existent location`, with no lock, for a directory it merely cannot enter — the same word it uses for one that is really gone. Discovery's filter dropped it, the branch was listed with no worktree, and `cleanState()` claimed no uncommitted work. That is the one answer nothing ever revisits, and `tryDirtyState`'s own comment forbids it. `prunable` means three things and only the filesystem separates the first from the third, so the filter now keeps an entry whose path still exists. Found while building a fixture for the snapshot pipeline, not by reading the code.

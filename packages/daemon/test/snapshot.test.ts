@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGitRunner } from '@interlock/core';
@@ -143,6 +143,29 @@ describe('snapshot pipeline', () => {
     await sweep.reconcile(root);
 
     expect(snapshots().filter((snapshot) => snapshot.treeOid === null)).toHaveLength(1);
+  });
+
+  it('announces the content again once an unreadable worktree comes back', async () => {
+    const linked = join(base, 'wt-flaky');
+    git(root, 'worktree', 'add', '-q', '-b', 'flaky', linked);
+    await sweep.reconcile(root);
+    const before = snapshots().find((snapshot) => snapshot.treeOid !== null)?.treeOid;
+
+    // Unreadable, reversibly: `git status` cannot enter the directory, so the
+    // branch is listed with an unknown dirty state rather than dropped.
+    chmodSync(linked, 0o000);
+    await sweep.reconcile(root);
+    chmodSync(linked, 0o755);
+    events.length = 0;
+
+    // Byte for byte what it was before the outage. Deduplicating against the
+    // tree from before would be silence, and downstream was last told
+    // "unknown" — so its view would stay unknown for good.
+    await sweep.reconcile(root);
+
+    const recovered = snapshots().filter((snapshot) => snapshot.treeOid !== null);
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]?.treeOid).toBe(before);
   });
 
   it('says nothing about a branch that is not checked out anywhere', async () => {

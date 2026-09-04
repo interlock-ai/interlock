@@ -4,6 +4,11 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-09-05
+
+- **Found and fixed a shipped bug: an unreadable worktree was reported clean.** `git worktree list --porcelain` prints `prunable gitdir file points to non-existent location`, with no lock, for a directory it merely cannot enter — the same word it uses for one that is really gone. Discovery's filter dropped it, the branch was listed with no worktree, and `cleanState()` claimed no uncommitted work. That is the one answer nothing ever revisits, and `tryDirtyState`'s own comment forbids it. `prunable` means three things and only the filesystem separates the first from the third, so the filter now keeps an entry whose path still exists. Found while building a fixture for the snapshot pipeline, not by reading the code.
+- **`chmod 000` is the reversible way to make a worktree unreadable**, and it is a different fixture from deleting the directory: git reports the same `prunable`, but the work is still there. Deleting is irreversible, which is why the recovery case had no test until now.
+
 ## 2026-09-04
 
 - **A repository registered by anything but its canonical root was announced as new on every pass.** `openUserRepo` resolves a subdirectory, a symlink or a linked worktree to the main worktree, and that is what `upsertRepo` stores — but the lookup used the caller's argument, so it never matched. Two consequences, and the second is the worse one: `repo.discovered` republished on a timer into an append-only log, and `describeOrKeep` left with no stored row to fall back on, which turns a malformed override file from "warn and keep the last good config" into "fail every pass". The fixture built canonical paths throughout, so nothing caught it.

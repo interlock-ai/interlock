@@ -59,6 +59,35 @@ describe('snapshot pipeline', () => {
     rmSync(base, { recursive: true, force: true });
   });
 
+  /**
+   * A sweep that counts how often a worktree was hashed.
+   *
+   * One hash is one `write-tree`, and nothing else in a pass runs it — so the
+   * count says whether the walk happened, which no event can: a hash that finds
+   * the same tree publishes nothing at all.
+   */
+  const countingSweep = (
+    options: { recaptureAfterMs?: number; now?: () => number } = {},
+  ): { sweep: Sweep; hashes: () => number } => {
+    let hashes = 0;
+    const real = createGitRunner();
+    return {
+      hashes: () => hashes,
+      sweep: createSweep({
+        store,
+        bus,
+        dataDir: join(base, 'data'),
+        ...options,
+        runner: {
+          run: (repo, args, runOptions) => {
+            if (args[0] === 'write-tree') hashes += 1;
+            return real.run(repo, args, runOptions);
+          },
+        },
+      }),
+    };
+  };
+
   it('publishes a snapshot carrying a tree and a change set', async () => {
     await sweep.reconcile(root);
 
@@ -100,6 +129,46 @@ describe('snapshot pipeline', () => {
     await sweep.reconcile(root);
 
     expect(snapshots()).toEqual([]);
+  });
+
+  it('consumes the mark, so one signal does not hash for ever', async () => {
+    const { sweep: counting, hashes } = countingSweep();
+    counting.markChanged(root);
+    await counting.reconcile(root);
+    const afterFirst = hashes();
+
+    // A mark that is never consumed makes every later pass hash again, which is
+    // the whole idle cost coming back for one edit.
+    writeFileSync(join(root, 'a.txt'), 'edited\n');
+    await counting.reconcile(root);
+
+    expect(hashes()).toBe(afterFirst);
+    expect(snapshots().filter((snapshot) => snapshot.treeOid !== null)).toHaveLength(1);
+  });
+
+  it('restarts the ceiling when a hash finds nothing new', async () => {
+    // Driven rather than waited on: the window that discriminates here is
+    // narrower than a pass takes, so a real clock decides the outcome by how
+    // long git happened to run.
+    let clock = 1_000;
+    const { sweep: counting, hashes } = countingSweep({
+      recaptureAfterMs: 100,
+      now: () => clock,
+    });
+    await counting.reconcile(root);
+
+    clock = 1_200;
+    counting.markChanged(root);
+    await counting.reconcile(root);
+    const afterCeiling = hashes();
+
+    // Inside the ceiling measured from the hash that just happened, and outside
+    // it measured from the one before — so a clock left where it was expires
+    // immediately and every pass from here hashes for ever.
+    clock = 1_250;
+    await counting.reconcile(root);
+
+    expect(hashes()).toBe(afterCeiling);
   });
 
   it('hashes anyway once the ceiling has passed', async () => {

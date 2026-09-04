@@ -32,8 +32,9 @@ export interface SweepOptions {
   /** Root of Interlock's data dir; shadow paths are derived from it. */
   readonly dataDir: string;
   readonly logger?: Logger;
-  /** Passed through to the snapshot pipeline; see its own option. */
+  /** Passed through to the snapshot pipeline; see its own options. */
   readonly recaptureAfterMs?: number;
+  readonly now?: () => number;
 }
 
 export interface SweepOutcome {
@@ -73,6 +74,7 @@ export function createSweep(options: SweepOptions): Sweep {
     ...(options.recaptureAfterMs === undefined
       ? {}
       : { recaptureAfterMs: options.recaptureAfterMs }),
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
   /**
    * One pass per repository at a time.

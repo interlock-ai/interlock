@@ -33,6 +33,8 @@ export interface SnapshotPipelineOptions {
    * is what makes it a ceiling rather than a cadence.
    */
   readonly recaptureAfterMs?: number;
+  /** Injectable so the ceiling can be crossed without waiting for it. */
+  readonly now?: () => number;
 }
 
 export interface SnapshotPipeline {
@@ -76,9 +78,12 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
    * what is on disk, and a branch that moves to another checkout is looking at
    * different files even where its head has not moved.
    */
-  const lastSeen = new Map<string, { treeOid: string; snapshotId: SnapshotId; at: number }>();
-  const changed = new Set<string>();
+  const lastSeen = new Map<
+    string,
+    { treeOid: string; snapshotId: SnapshotId; at: number; changed: boolean }
+  >();
   const recaptureAfterMs = options.recaptureAfterMs ?? DEFAULT_RECAPTURE_AFTER_MS;
+  const now = options.now ?? Date.now;
 
   return {
     async capture(handle: UserRepo, repo: Repo, branch: BranchRef): Promise<void> {
@@ -94,22 +99,20 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
       }
 
       const previous = lastSeen.get(branch.worktreePath);
-      if (previous !== undefined && !changed.has(branch.worktreePath)) {
-        // Nothing said this worktree moved. Hashing it anyway is the whole idle
-        // cost of the daemon, and it buys only the changes the filesystem
-        // failed to report — which the ceiling below still catches.
-        if (Date.now() - previous.at < recaptureAfterMs) {
-          await rememberOn(branch, previous.snapshotId);
-          return;
-        }
+      // Nothing said this worktree moved. Hashing it anyway is the whole idle
+      // cost of the daemon, and it buys only the changes the filesystem failed
+      // to report — which the ceiling still catches. A worktree with no entry
+      // has never been hashed, so it is hashed whatever anyone reported.
+      if (previous !== undefined && !previous.changed && now() - previous.at < recaptureAfterMs) {
+        await rememberOn(branch, previous.snapshotId);
+        return;
       }
-      changed.delete(branch.worktreePath);
 
       const snapshot = await captureDirtyState(branch.worktreePath, handle, { runner });
       if (previous?.treeOid === snapshot.treeOid) {
         // Same content, so the clock restarts: without this the ceiling stays
         // expired and every later pass hashes the worktree again.
-        lastSeen.set(branch.worktreePath, { ...previous, at: Date.now() });
+        lastSeen.set(branch.worktreePath, { ...previous, at: now(), changed: false });
         // The row still has to name the snapshot this content belongs to; the
         // sweep re-lists every branch with a null id and would otherwise leave
         // `contentIdentity` reading two different dirty states as one.
@@ -128,7 +131,8 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
         lastSeen.set(branch.worktreePath, {
           treeOid: snapshot.treeOid,
           snapshotId,
-          at: Date.now(),
+          at: now(),
+          changed: false,
         });
         await rememberOn(branch, snapshotId);
         await publish(branch, snapshot.treeOid, null, 0);
@@ -140,18 +144,26 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
         snapshot: { id: snapshotId, treeOid: snapshot.treeOid },
       });
       await store.upsertChangeSet(changeSet);
-      lastSeen.set(branch.worktreePath, { treeOid: snapshot.treeOid, snapshotId, at: Date.now() });
+      lastSeen.set(branch.worktreePath, {
+        treeOid: snapshot.treeOid,
+        snapshotId,
+        at: now(),
+        changed: false,
+      });
       await rememberOn(branch, snapshotId);
       await publish(branch, snapshot.treeOid, changeSet.id, changeSet.files.length);
     },
 
     markChanged(worktreePath: string): void {
-      changed.add(worktreePath);
+      const previous = lastSeen.get(worktreePath);
+      // Recorded on the entry rather than beside it: a worktree with no entry
+      // is hashed regardless, so a mark for one would be state that only ever
+      // needed cleaning up.
+      if (previous !== undefined) lastSeen.set(worktreePath, { ...previous, changed: true });
     },
 
     forget(worktreePath: string): void {
       lastSeen.delete(worktreePath);
-      changed.delete(worktreePath);
     },
   };
 

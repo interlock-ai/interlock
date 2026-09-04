@@ -4,6 +4,7 @@ import { isInterlockError, matchesGlob, silentLogger } from '@interlock/shared';
 import type { BranchRef, Logger, Repo } from '@interlock/shared';
 import type { EventBus } from '../bus/index.js';
 import type { Store } from '../store/index.js';
+import { createSnapshotPipeline } from './snapshot.js';
 
 /**
  * Reconciles what git reports against what the store holds.
@@ -54,6 +55,12 @@ export interface Sweep {
 export function createSweep(options: SweepOptions): Sweep {
   const log = (options.logger ?? silentLogger).child('sweep');
   const { store, bus, runner, dataDir } = options;
+  const snapshots = createSnapshotPipeline({
+    store,
+    bus,
+    runner,
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+  });
   /**
    * One pass per repository at a time.
    *
@@ -126,6 +133,11 @@ export function createSweep(options: SweepOptions): Sweep {
           dirty: dirtyFlag(after),
         });
       }
+
+      // After the row exists, so a snapshot never names a branch the store has
+      // not heard of, and after the announcement, so replay reads the change
+      // before the content it produced.
+      await snapshots.capture(handle, repo, after);
     }
 
     const ignored = (name: string): boolean =>
@@ -148,6 +160,7 @@ export function createSweep(options: SweepOptions): Sweep {
       });
       // Its merge pairs and change sets go with it, by cascade.
       await store.deleteBranchRef(gone.id);
+      if (gone.worktreePath !== null) snapshots.forget(gone.worktreePath);
     }
   };
 

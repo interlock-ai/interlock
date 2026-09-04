@@ -1,7 +1,14 @@
 import { captureDirtyState, extractChangeSet, mergeBase } from '@interlock/core';
 import type { GitRunner, UserRepo } from '@interlock/core';
 import { isInterlockError, silentLogger, ulid } from '@interlock/shared';
-import type { BranchRef, ChangeSetId, Logger, Repo, SnapshotId } from '@interlock/shared';
+import type {
+  BranchRef,
+  BranchRefId,
+  ChangeSetId,
+  Logger,
+  Repo,
+  SnapshotId,
+} from '@interlock/shared';
 import type { EventBus } from '../bus/index.js';
 import type { Store } from '../store/index.js';
 
@@ -75,9 +82,18 @@ const DEFAULT_RECAPTURE_AFTER_MS = 60_000;
  * and what makes the next readable pass an announcement rather than a repeat.
  */
 type LastPublished =
-  | { readonly kind: 'unknown' }
+  | { readonly kind: 'unknown'; readonly branchRefId: BranchRefId }
   | {
       readonly kind: 'tree';
+      /**
+       * Which branch that tree was announced for.
+       *
+       * A worktree switched to a new branch has the same content and so the
+       * same tree, but nothing downstream has heard of the branch — comparing
+       * the tree alone says nothing happened, and stamps the new branch with
+       * the old one's snapshot.
+       */
+      readonly branchRefId: BranchRefId;
       readonly treeOid: string;
       readonly snapshotId: SnapshotId;
       readonly at: number;
@@ -111,8 +127,8 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
         // hundreds of identical rows an hour into a log that retention only
         // trims by age. `moved` in the sweep reads null to null as no change
         // for the same reason, and the two must not disagree about it.
-        if (previous?.kind === 'unknown') return;
-        lastSeen.set(branch.worktreePath, { kind: 'unknown' });
+        if (previous?.kind === 'unknown' && previous.branchRefId === branch.id) return;
+        lastSeen.set(branch.worktreePath, { kind: 'unknown', branchRefId: branch.id });
         await publish(branch, null, null, 0);
         return;
       }
@@ -123,8 +139,10 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
       // has never been hashed, so it is hashed whatever anyone reported.
       // An entry saying `unknown` falls through to the hash, so a worktree that
       // came back is announced now rather than at the ceiling.
+      const sameBranch = previous?.branchRefId === branch.id;
       if (
         previous?.kind === 'tree' &&
+        sameBranch &&
         !previous.changed &&
         now() - previous.at < recaptureAfterMs
       ) {
@@ -132,11 +150,24 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
         return;
       }
 
+      // Cleared before the walk, not after: a signal arriving while it runs
+      // describes content the walk may already have missed, and writing
+      // `changed: false` on the way out would drop it until the ceiling.
+      if (previous?.kind === 'tree') {
+        lastSeen.set(branch.worktreePath, { ...previous, changed: false });
+      }
       const snapshot = await captureDirtyState(branch.worktreePath, handle, { runner });
-      if (previous?.kind === 'tree' && previous.treeOid === snapshot.treeOid) {
+      const marked = lastSeen.get(branch.worktreePath);
+      const changedDuringCapture = marked?.kind === 'tree' && marked.changed;
+
+      if (previous?.kind === 'tree' && sameBranch && previous.treeOid === snapshot.treeOid) {
         // Same content, so the clock restarts: without this the ceiling stays
         // expired and every later pass hashes the worktree again.
-        lastSeen.set(branch.worktreePath, { ...previous, at: now(), changed: false });
+        lastSeen.set(branch.worktreePath, {
+          ...previous,
+          at: now(),
+          changed: changedDuringCapture,
+        });
         // The row still has to name the snapshot this content belongs to; the
         // sweep re-lists every branch with a null id and would otherwise leave
         // `contentIdentity` reading two different dirty states as one.
@@ -154,10 +185,11 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
         });
         lastSeen.set(branch.worktreePath, {
           kind: 'tree',
+          branchRefId: branch.id,
           treeOid: snapshot.treeOid,
           snapshotId,
           at: now(),
-          changed: false,
+          changed: changedDuringCapture,
         });
         await rememberOn(branch, snapshotId);
         await publish(branch, snapshot.treeOid, null, 0);
@@ -171,10 +203,11 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
       await store.upsertChangeSet(changeSet);
       lastSeen.set(branch.worktreePath, {
         kind: 'tree',
+        branchRefId: branch.id,
         treeOid: snapshot.treeOid,
         snapshotId,
         at: now(),
-        changed: false,
+        changed: changedDuringCapture,
       });
       await rememberOn(branch, snapshotId);
       await publish(branch, snapshot.treeOid, changeSet.id, changeSet.files.length);

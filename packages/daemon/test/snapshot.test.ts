@@ -324,6 +324,122 @@ describe('snapshot pipeline', () => {
     expect(outcome.failed).toEqual([root]);
   });
 
+  it('announces a worktree that switched branches with the same content', async () => {
+    writeFileSync(join(root, 'a.txt'), 'work in progress\n');
+    sweep.markChanged(root);
+    await sweep.reconcile(root);
+    events.length = 0;
+
+    // The content is byte for byte what it was, so the tree is the same — but
+    // it belongs to another branch now, and nothing downstream has ever been
+    // told anything about that branch.
+    git(root, 'checkout', '-q', '-b', 'feature');
+    sweep.markChanged(root);
+    await sweep.reconcile(root);
+
+    expect(snapshots()).toHaveLength(1);
+    const [repo] = await store.listRepos();
+    const feature = (await store.listBranchRefs(repo!.id)).find(
+      (branch) => branch.name === 'feature',
+    );
+    expect(snapshots()[0]?.branchRefId).toBe(feature?.id);
+  });
+
+  it('snapshots every other branch when one of them throws', async () => {
+    const linked = join(base, 'wt-feature');
+    git(root, 'worktree', 'add', '-q', '-b', 'feature', linked);
+    const real = createGitRunner();
+    let broken = false;
+    const flaky = createSweep({
+      store,
+      bus,
+      dataDir: join(base, 'data'),
+      runner: {
+        run: (repo, args, runOptions) => {
+          // One branch's hash fails; the others must still be taken.
+          if (broken && args[0] === 'write-tree') throw new Error('one branch is unhappy');
+          return real.run(repo, args, runOptions);
+        },
+      },
+    });
+    await flaky.all([root]);
+    events.length = 0;
+    broken = true;
+
+    // Both worktrees are marked, so both would be hashed: without the guard the
+    // first throw ends the loop and the second branch is never reached.
+    flaky.markChanged(root);
+    flaky.markChanged(linked);
+    const outcome = await flaky.all([root]);
+
+    // Reported, because a pass that could not snapshot something did not
+    // succeed — and a broken runner behind a quiet log line is how that goes
+    // unnoticed for a week.
+    expect(outcome.failed).toEqual([root]);
+    // But the loop ran to the end, rather than starving every branch after the
+    // one that threw on this pass and every pass after it.
+    expect(snapshots().filter((snapshot) => snapshot.treeOid === null)).toEqual([]);
+  });
+
+  it('announces everything again after a restart', async () => {
+    writeFileSync(join(root, 'a.txt'), 'work\n');
+    sweep.markChanged(root);
+    await sweep.reconcile(root);
+    events.length = 0;
+
+    // A new pipeline remembers nothing. Announcing content downstream may
+    // already hold is the safe direction — a restarted consumer holds nothing
+    // either — and the cost is one hash per worktree, once. Persisting the last
+    // tree would buy that back at the price of a cache in the schema.
+    const restarted = createSweep({
+      store,
+      bus,
+      runner: createGitRunner(),
+      dataDir: join(base, 'data'),
+    });
+    await restarted.reconcile(root);
+
+    expect(snapshots()).toHaveLength(1);
+  });
+
+  it('keeps a mark that arrives while the hash is running', async () => {
+    const real = createGitRunner();
+    let marking: (() => void) | null = null;
+    const racing = createSweep({
+      store,
+      bus,
+      dataDir: join(base, 'data'),
+      runner: {
+        run: async (repo, args, runOptions) => {
+          const result = await real.run(repo, args, runOptions);
+          // A signal landing mid-walk describes content the walk may already
+          // have passed over, so clearing the mark afterwards would drop it
+          // until the ceiling.
+          if (args[0] === 'write-tree' && marking !== null) {
+            marking();
+            marking = null;
+          }
+          return result;
+        },
+      },
+    });
+    racing.markChanged(root);
+    await racing.reconcile(root);
+    events.length = 0;
+
+    marking = () => {
+      writeFileSync(join(root, 'a.txt'), 'landed mid-hash\n');
+      racing.markChanged(root);
+    };
+    racing.markChanged(root);
+    await racing.reconcile(root);
+    events.length = 0;
+
+    await racing.reconcile(root);
+
+    expect(snapshots()).toHaveLength(1);
+  });
+
   it('says nothing about a branch that is not checked out anywhere', async () => {
     git(root, 'branch', 'feature');
     await sweep.reconcile(root);

@@ -4,6 +4,14 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-09-05 — a third review, three real bugs
+
+- **A worktree switching branches published nothing, and mislabelled what it kept.** Identity was the worktree alone, so `checkout -b` over work in progress produced the same tree, the dedupe read it as no change, and `rememberOn` stamped the new branch with the old branch's snapshot. Nothing downstream ever heard the new branch existed. Reproduced red before fixing. The remembered identity is the worktree _and_ the branch in it now.
+- **One branch's failure starved every branch after it, on every pass.** A capture that throws — a worktree removed mid-pass will — escaped the loop. Held rather than swallowed: the loop runs to the end and the failure is rethrown after it, because a pass that could not snapshot something did not succeed and a broken runner behind a quiet log line goes unnoticed for a week. Both properties are tested, and the second was found by the first attempt breaking the existing merge-base test.
+- **A mark arriving during a hash was discarded.** `changed: false` was written on the way out, so a signal describing content the walk had already passed over was lost until the ceiling. The flag is cleared before the walk and whatever landed during it survives.
+- **Accepted deliberately, and now pinned: a restart announces everything again.** The remembered identity is in memory. Republishing content a consumer may already hold is the safe direction — a restarted consumer holds nothing either — and it costs one hash per worktree, once. Persisting the last tree would buy that back for the price of a cache in the schema, which is a trade to make when something needs it.
+- **Two of that review's findings were already fixed and one was wrong.** The unknown-every-pass flooding went in the previous round; single-flight has five tests rather than none, and the double-run window it describes resolves correctly in both orderings, which those tests cover. Both readings were of an older revision.
+
 ## 2026-09-05 — two review findings, both real
 
 - **An unreadable worktree was announced on every pass, for ever.** The `dirty === null` path published unconditionally: a worktree on an unmounted volume writes roughly seven hundred identical rows an hour into a log retention only trims by age. The comment justified the _first_ one — silence would read as "nothing changed" — and that argument covers the transition, not the repetition. Worse, `moved` in the sweep already treats null to null as no change, so two modules held opposite answers about the same state. What was last said about a worktree is now a value, `unknown` or a tree, and only a change to it is published.

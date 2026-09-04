@@ -119,6 +119,8 @@ export function createSweep(options: SweepOptions): Sweep {
         : { ignoreBranches: repo.config.ignoreBranches }),
     });
 
+    let failure: Error | undefined;
+
     // Keyed on `ref` rather than id: discovery mints a fresh ULID per
     // observation, so the id says nothing about whether this branch is new.
     const remaining = new Map((await store.listBranchRefs(repo.id)).map((ref) => [ref.ref, ref]));
@@ -152,7 +154,19 @@ export function createSweep(options: SweepOptions): Sweep {
       // After the row exists, so a snapshot never names a branch the store has
       // not heard of, and after the announcement, so replay reads the change
       // before the content it produced.
-      await snapshots.capture(handle, repo, after);
+      try {
+        await snapshots.capture(handle, repo, after);
+      } catch (error) {
+        // Held, not swallowed. Letting it out here starves every branch after
+        // this one on every later pass — a worktree removed mid-pass throws —
+        // but a pass that could not snapshot something did not succeed, and
+        // reporting otherwise hides a broken runner behind a quiet log line.
+        log.warn('could not snapshot a branch', {
+          branch: after.name,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        failure ??= error instanceof Error ? error : new Error(String(error));
+      }
     }
 
     const ignored = (name: string): boolean =>
@@ -177,6 +191,8 @@ export function createSweep(options: SweepOptions): Sweep {
       await store.deleteBranchRef(gone.id);
       if (gone.worktreePath !== null) snapshots.forget(gone.worktreePath);
     }
+
+    if (failure !== undefined) throw failure;
   };
 
   const reconcileResolved = async (handle: UserRepo): Promise<void> => {

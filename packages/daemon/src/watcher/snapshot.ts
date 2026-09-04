@@ -82,7 +82,7 @@ const DEFAULT_RECAPTURE_AFTER_MS = 60_000;
  * and what makes the next readable pass an announcement rather than a repeat.
  */
 type LastPublished =
-  | { readonly kind: 'unknown'; readonly branchRefId: BranchRefId }
+  | { readonly kind: 'unknown' }
   | {
       readonly kind: 'tree';
       /**
@@ -127,8 +127,8 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
         // hundreds of identical rows an hour into a log that retention only
         // trims by age. `moved` in the sweep reads null to null as no change
         // for the same reason, and the two must not disagree about it.
-        if (previous?.kind === 'unknown' && previous.branchRefId === branch.id) return;
-        lastSeen.set(branch.worktreePath, { kind: 'unknown', branchRefId: branch.id });
+        if (previous?.kind === 'unknown') return;
+        lastSeen.set(branch.worktreePath, { kind: 'unknown' });
         await publish(branch, null, null, 0);
         return;
       }
@@ -139,7 +139,7 @@ export function createSnapshotPipeline(options: SnapshotPipelineOptions): Snapsh
       // has never been hashed, so it is hashed whatever anyone reported.
       // An entry saying `unknown` falls through to the hash, so a worktree that
       // came back is announced now rather than at the ceiling.
-      const sameBranch = previous?.branchRefId === branch.id;
+      const sameBranch = previous?.kind === 'tree' && previous.branchRefId === branch.id;
       if (
         previous?.kind === 'tree' &&
         sameBranch &&

@@ -333,8 +333,11 @@ describe('snapshot pipeline', () => {
     // The content is byte for byte what it was, so the tree is the same — but
     // it belongs to another branch now, and nothing downstream has ever been
     // told anything about that branch.
+    // No `markChanged`: `checkout -b` writes `HEAD` inside the git directory,
+    // which the ref watcher sees and the worktree watcher does not — so the
+    // gate would skip the hash and the switch would go unnoticed until the
+    // ceiling, which is minutes of a branch nobody has heard of.
     git(root, 'checkout', '-q', '-b', 'feature');
-    sweep.markChanged(root);
     await sweep.reconcile(root);
 
     expect(snapshots()).toHaveLength(1);
@@ -356,8 +359,13 @@ describe('snapshot pipeline', () => {
       dataDir: join(base, 'data'),
       runner: {
         run: (repo, args, runOptions) => {
-          // One branch's hash fails; the others must still be taken.
-          if (broken && args[0] === 'write-tree') throw new Error('one branch is unhappy');
+          // Only the first hash of the pass fails, so the branch after it has
+          // something to prove: a throw that escapes the loop leaves it with no
+          // snapshot at all.
+          if (broken && args[0] === 'write-tree') {
+            broken = false;
+            throw new Error('one branch is unhappy');
+          }
           return real.run(repo, args, runOptions);
         },
       },
@@ -366,8 +374,11 @@ describe('snapshot pipeline', () => {
     events.length = 0;
     broken = true;
 
-    // Both worktrees are marked, so both would be hashed: without the guard the
-    // first throw ends the loop and the second branch is never reached.
+    // Both worktrees have moved and both are marked, so both would be hashed
+    // and both have something to announce: without the guard the first throw
+    // ends the loop and the second branch is never reached.
+    writeFileSync(join(root, 'a.txt'), 'main moved\n');
+    writeFileSync(join(linked, 'a.txt'), 'feature moved\n');
     flaky.markChanged(root);
     flaky.markChanged(linked);
     const outcome = await flaky.all([root]);
@@ -376,9 +387,9 @@ describe('snapshot pipeline', () => {
     // succeed — and a broken runner behind a quiet log line is how that goes
     // unnoticed for a week.
     expect(outcome.failed).toEqual([root]);
-    // But the loop ran to the end, rather than starving every branch after the
-    // one that threw on this pass and every pass after it.
-    expect(snapshots().filter((snapshot) => snapshot.treeOid === null)).toEqual([]);
+    // And the loop ran to the end: the branch after the one that threw was
+    // snapshotted, rather than starved on this pass and every pass after it.
+    expect(snapshots().filter((snapshot) => snapshot.treeOid !== null)).toHaveLength(1);
   });
 
   it('announces everything again after a restart', async () => {

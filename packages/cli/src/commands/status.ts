@@ -1,4 +1,4 @@
-import { DEFAULT_DATA_DIR, InterlockError, isInterlockError } from '@interlock/shared';
+import { InterlockError, dataDirFrom, isInterlockError } from '@interlock/shared';
 import { connectDaemon } from '../client/daemon-client.js';
 import { renderJson, renderStatus } from '../render.js';
 import type { RepoView } from '../render.js';
@@ -70,7 +70,8 @@ function parseArgs(args: readonly string[], env: StatusIo['env']): Options {
   // is the person most likely to have wanted this — refusing to explain the
   // options because one of them was wrong is the least helpful moment to stop.
   const help = args.includes('--help') || args.includes('-h');
-  let dataDir = env.INTERLOCK_DATA_DIR ?? DEFAULT_DATA_DIR;
+  // The same reading the daemon does, so both look in one place.
+  let dataDir = dataDirFrom(env);
   if (help) return { json: false, dataDir, help };
 
   for (let index = 0; index < args.length; index++) {

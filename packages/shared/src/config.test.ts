@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import {
   DEFAULT_CONFIG,
+  DEFAULT_DATA_DIR,
   MAX_IGNORE_PATTERN_LENGTH,
   MAX_IGNORE_PATTERNS,
+  dataDirFrom,
+  parseConfigFile,
   parseRepoConfigOverride,
   resolveConfig,
   validateConfig,
@@ -67,6 +72,11 @@ function problemsFrom(source: string): string[] {
 }
 
 describe('validateConfig', () => {
+  it('refuses a relative data dir, as it refuses a relative repository', () => {
+    const problems = validateConfig({ ...DEFAULT_CONFIG, dataDir: 'relative/data' });
+    expect(problems).toContain('dataDir must be absolute: relative/data');
+  });
+
   const { scheduler: S, sandbox: B, mcp: M } = DEFAULT_CONFIG;
 
   it('refuses a value of the wrong type before testing its range', () => {
@@ -232,6 +242,139 @@ describe('parseRepoConfigOverride', () => {
   it('reports every problem at once', () => {
     const problems = problemsFrom(
       JSON.stringify({ nope: 1, ignore: 5, toolchain: { build: 7, wat: 'x' } }),
+    );
+    expect(problems).toHaveLength(4);
+  });
+});
+
+describe('dataDirFrom', () => {
+  it('reads the variable the CLI reads, so both look in one place', () => {
+    expect(dataDirFrom({ INTERLOCK_DATA_DIR: '/elsewhere' })).toBe('/elsewhere');
+  });
+
+  it('falls back to the default when the variable is unset or empty', () => {
+    expect(dataDirFrom({})).toBe(DEFAULT_DATA_DIR);
+    // `INTERLOCK_DATA_DIR= interlockd` is not a request for the current
+    // directory.
+    expect(dataDirFrom({ INTERLOCK_DATA_DIR: '' })).toBe(DEFAULT_DATA_DIR);
+  });
+
+  it('refuses a relative path and names the variable, not the store', () => {
+    // Left to whatever opens the directory first, this was reported by the
+    // store with a remedy about database paths and `:memory:`.
+    try {
+      dataDirFrom({ INTERLOCK_DATA_DIR: './relative' });
+    } catch (error) {
+      if (!isInterlockError(error)) throw error;
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.message).toContain('INTERLOCK_DATA_DIR');
+      expect(error.remedy).toContain('INTERLOCK_DATA_DIR');
+      expect(error.remedy).not.toContain('memory');
+      return;
+    }
+    throw new Error('expected the relative path to be refused');
+  });
+});
+
+describe('parseConfigFile', () => {
+  const PATH = '/data/config.json';
+
+  const problemsOf = (source: string): string[] => {
+    try {
+      parseConfigFile(source, PATH);
+    } catch (error) {
+      if (!isInterlockError(error)) throw error;
+      expect(error.code).toBe('CONFIG_INVALID');
+      return error.details.problems as string[];
+    }
+    throw new Error('expected the file to be refused');
+  };
+
+  it('reads the sections a user may set', () => {
+    const input = parseConfigFile(
+      JSON.stringify({
+        repos: ['/work/one'],
+        daemon: { port: 5000 },
+        scheduler: { debounceMs: 100 },
+        logLevel: 'debug',
+      }),
+      PATH,
+    );
+    expect(input).toStrictEqual({
+      repos: ['/work/one'],
+      daemon: { port: 5000 },
+      scheduler: { debounceMs: 100 },
+      logLevel: 'debug',
+    });
+  });
+
+  it('reads an empty object as no overrides', () => {
+    expect(parseConfigFile('{}', PATH)).toStrictEqual({});
+  });
+
+  it('tolerates a leading byte-order mark', () => {
+    expect(parseConfigFile('\uFEFF{"logLevel":"warn"}', PATH)).toStrictEqual({ logLevel: 'warn' });
+  });
+
+  it('refuses a file that is not JSON, or not an object', () => {
+    expect(problemsOf('not json')).toStrictEqual(['file is not valid JSON']);
+    expect(problemsOf('[]')).toStrictEqual(['top level must be a JSON object']);
+    expect(problemsOf('"repos"')).toStrictEqual(['top level must be a JSON object']);
+  });
+
+  it('refuses a key it does not recognise, and names it', () => {
+    // `repo` for `repos` is the typo every user makes first, and merged by
+    // spread it watches nothing without a word.
+    const problems = problemsOf(JSON.stringify({ repo: ['/work/one'] }));
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('`repo`');
+    expect(problems[0]).toContain('repos');
+  });
+
+  it('refuses an unknown key inside a section', () => {
+    const problems = problemsOf(JSON.stringify({ scheduler: { debounce: 5 } }));
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('scheduler');
+    expect(problems[0]).toContain('`debounce`');
+    expect(problems[0]).toContain('debounceMs');
+  });
+
+  it('refuses a section that is not an object', () => {
+    // Spread, a string puts one key per character into the section and the
+    // result passes validation with the defaults intact.
+    expect(problemsOf(JSON.stringify({ daemon: 'abc' }))).toStrictEqual([
+      'daemon must be a JSON object',
+    ]);
+    expect(problemsOf(JSON.stringify({ sandbox: [] }))).toStrictEqual([
+      'sandbox must be a JSON object',
+    ]);
+  });
+
+  it('refuses dataDir, because the data dir is where the file was found', () => {
+    const problems = problemsOf(JSON.stringify({ dataDir: '/elsewhere' }));
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('dataDir cannot be set here');
+  });
+
+  it('expands ~/ in a repository path and nothing else', () => {
+    const input = parseConfigFile(JSON.stringify({ repos: ['~/work/one', '/abs'] }), PATH);
+    expect(input.repos).toStrictEqual([join(homedir(), 'work/one'), '/abs']);
+
+    const problems = problemsOf(JSON.stringify({ repos: ['~someone/work'] }));
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('only ~/ is expanded');
+  });
+
+  it('leaves a value of the wrong type for validateConfig to name', () => {
+    // Shape here, values there: a number where a path list belongs is not a
+    // shape this file refuses, and the split keeps one schema rather than two.
+    const input = parseConfigFile(JSON.stringify({ repos: 5 }), PATH);
+    expect(() => resolveConfig(input)).toThrowError(/repos must be an array/u);
+  });
+
+  it('reports every problem at once', () => {
+    const problems = problemsOf(
+      JSON.stringify({ repo: [], dataDir: '/x', daemon: 'abc', mcp: { prot: 1 } }),
     );
     expect(problems).toHaveLength(4);
   });

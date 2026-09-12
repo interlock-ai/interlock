@@ -4,11 +4,12 @@
  *
  * Started by `interlock daemon start`; runnable directly for debugging.
  */
-import { createLogger, resolveConfig } from '@interlock/shared';
+import { createLogger, dataDirFrom, isInterlockError, loadConfig } from '@interlock/shared';
 import { createDaemon } from './daemon.js';
 
 async function main(): Promise<void> {
-  const config = resolveConfig();
+  // The data dir comes from the environment, not the file: the file is in it.
+  const config = loadConfig(dataDirFrom(process.env));
   const logger = createLogger('daemon', { level: config.logLevel });
   const daemon = createDaemon({ config, logger });
 
@@ -37,6 +38,13 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  process.stderr.write(`${JSON.stringify({ level: 'error', msg: String(error) })}\n`);
+  // The logger may not exist yet — its level comes from the config, and the
+  // config is the likeliest thing to have failed. Same shape as a log record,
+  // with the code and the remedy carried rather than flattened into the
+  // message: the remedy is the part a person can act on.
+  const record = isInterlockError(error)
+    ? { level: 'error', msg: error.message, code: error.code, remedy: error.remedy }
+    : { level: 'error', msg: error instanceof Error ? error.message : String(error) };
+  process.stderr.write(`${JSON.stringify(record)}\n`);
   process.exit(1);
 });

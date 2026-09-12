@@ -61,6 +61,11 @@ describe('the daemon never modifies a user repository', () => {
     execFileSync('git', ['init', '-q', '-b', 'main', root], { stdio: 'pipe' });
     git(root, 'config', 'user.name', 'Interlock Test');
     git(root, 'config', 'user.email', 'test@example.invalid');
+    // No detached `maintenance run --auto` after the fixture's own commits: it
+    // holds `objects/maintenance.lock` after `commit` returns, and a capture
+    // that sees it would blame the daemon for a lock the fixture's git left.
+    git(root, 'config', 'maintenance.auto', 'false');
+    git(root, 'config', 'gc.auto', '0');
     writeFileSync(join(root, 'a.txt'), 'a\n');
     git(root, 'add', '-A');
     git(root, 'commit', '-qm', 'one');

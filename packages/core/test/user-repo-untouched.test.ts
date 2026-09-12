@@ -62,6 +62,14 @@ describe('user repositories are never modified', () => {
     git(path, 'config', 'user.email', 'test@example.invalid');
     // Loose refs, not packed, until a fixture packs them on purpose.
     git(path, 'config', 'core.logAllRefUpdates', 'true');
+    // The fixture must have no background writer of its own. Since git 2.47,
+    // `commit` spawns `maintenance run --auto --detach`, and that child holds
+    // `objects/maintenance.lock` for a moment after `commit` has returned — so
+    // a capture taken right after a commit can see the lock, and the next one
+    // cannot, and the diff reports a removal Interlock never made. Interlock
+    // runs nothing that triggers maintenance; the fixture's git does.
+    git(path, 'config', 'maintenance.auto', 'false');
+    git(path, 'config', 'gc.auto', '0');
   };
 
   const commit = (path: string, file: string, content: string, message: string): void => {
@@ -189,7 +197,21 @@ describe('user repositories are never modified', () => {
       execFileSync('git', ['-C', root, 'hash-object', '-w', '--stdin'], { input: 'new\n' });
       // The same blob again, which freshens the existing file's mtime.
       execFileSync('git', ['-C', root, 'hash-object', '-w', '--stdin'], { input: 'new\n' });
-      expect(isClean(diffState(before, captureState(root)))).toBe(true);
+      const after = captureState(root);
+      const diff = diffState(before, after);
+      expect(isClean(diff), describeDiff(diff, before, after)).toBe(true);
+    });
+
+    it('names an object that vanished, whatever is allowed to appear there', () => {
+      // The allowance under `objects/` is for additions and freshening only.
+      // A removal there is what a lock file left by a fixture's own git looked
+      // like from the far side of a capture, and it has to be reported.
+      const before = captureState(root);
+      const object = [...before.keys()].find((path) => /objects[/\\][0-9a-f]{2}[/\\]/u.test(path));
+      expect(object).toBeDefined();
+      rmSync(join(root, object!));
+      const diff = diffState(before, captureState(root));
+      expect(diff.removed).toStrictEqual([object]);
     });
 
     it('names an object whose content changed, which is corruption', () => {

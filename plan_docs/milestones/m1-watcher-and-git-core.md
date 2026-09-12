@@ -554,8 +554,8 @@ status` must not stop the process exiting, so the drain has a deadline and
   is M6's Daemon UX task, and the remedy names `interlockd`, which is the daemon
   package's bin and exists today. The remedy changes when M6 lands.
 
-- [ ] **Load the config file**
-      **Files:** `packages/shared/src/config.ts`, `packages/daemon/src/main.ts`
+- [x] **Load the config file**
+      **Files:** `packages/shared/src/config.ts`, `packages/daemon/src/main.ts`, `packages/cli/src/commands/status.ts`
       **What:** read `config.json` from the data dir into `resolveConfig`.
 
   `resolveConfig()` is called with no argument, so `repos` is always empty, the
@@ -565,21 +565,60 @@ status` must not stop the process exiting, so the drain has a deadline and
   edit, showing in `interlock status` — cannot be demonstrated without this, and
   no other task owns it.
 
-  Its own task rather than a clause on the command above, because it is a daemon
-  concern: `interlock status` renders whatever the API reports and is finished
+  Its own task rather than a clause on `interlock status`, because it is a
+  daemon concern: the command renders whatever the API reports and is finished
   without it, while the milestone is not.
 
-  The file is written by the user rather than by a repository, so it is not the
-  adversarial input `.interlock.json` is — but it reaches the same
-  `validateConfig`, a missing file is normal and an unparseable one is not, and
-  the difference has to be visible. Reuse the validation that exists; do not add
-  a second schema.
+  **The file is in the data dir, and the data dir is a config value.** So the
+  data dir cannot come from the file. It comes from `INTERLOCK_DATA_DIR` and
+  otherwise the default, resolved by one function in `shared` that the daemon
+  and the CLI both call — the CLI already reads that variable, and two
+  resolutions of the same variable are one bug waiting for a rename. A
+  `dataDir` key inside the file is refused rather than honoured: the data dir is
+  where the file was found, and a file naming a different one is contradicting
+  its own location.
+
+  **Reuse `validateConfig`; it is the schema. But it is half of one.** It checks
+  types and ranges and nothing else, and `resolveConfig` merges by spread — so a
+  file saying `repo` instead of `repos` watches nothing without a word, one
+  saying `scheduler.debounce` keeps the default without a word, and one saying
+  `"daemon": "abc"` spreads three characters into the daemon section and passes.
+  All three measured. `.interlock.json` refuses an unknown key because a typo
+  that quietly does nothing is indistinguishable from a setting that was never
+  applied, and the same reasoning applies here with more force: this file is
+  the one a user edits on purpose. The parser checks shape — an object where an
+  object is expected, no keys outside the ones `DEFAULT_CONFIG` has — and
+  `validateConfig` checks values, which is the split the override file already
+  uses. Not a second schema: the keys are read off the defaults.
+
+  **A missing file is the defaults. A file that cannot be read is not.**
+  `ENOENT` is the normal first start; `EACCES`, `EISDIR` and a parse failure are
+  each an error naming the path and what was wrong with it, because a daemon
+  that silently ran on defaults over a config it could not open would look
+  exactly like one that was never configured.
+
+  **Paths.** A relative repository path is refused rather than resolved against
+  whatever directory the daemon happened to start in — `validateConfig` already
+  does this. `~/` is expanded, since it is the one thing a config file
+  legitimately wants to name portably and it depends on the user rather than on
+  the working directory; any other `~` form is refused with a remedy that says
+  so. A repository that does not exist yet is **not** a config error: the sweep
+  already contains a failing repository to itself and retries it every pass,
+  and a config that refused to load because a clone had not happened yet would
+  have to be edited twice.
+
+  The file is written by the user, not by a repository, so it does not get the
+  `O_NOFOLLOW` and size-cap treatment `.interlock.json` gets. It does get the
+  byte-order mark stripped, for the same reason that one does.
 
   **Done when:** a data dir with no config file starts on the defaults; one with
-  a valid file watches the repositories it names; one with a malformed file
-  refuses to start and names what is wrong; and a relative repository path is
-  refused rather than resolved against whatever directory the daemon happened to
-  start in.
+  a valid file watches the repositories it names, `~/` included; a malformed
+  file, an unknown key at the top level, an unknown key inside a section, a
+  section that is not an object, and a `dataDir` key each refuse to load and
+  name what is wrong; a file that exists but cannot be read is an error rather
+  than the defaults; `interlockd` started against a bad file exits non-zero with
+  the problem on stderr, proven by running it; and the daemon and the CLI read
+  `INTERLOCK_DATA_DIR` through the same function.
 
 - [ ] **Agent session hooks**
       **Files:** `packages/daemon/src/hooks/`

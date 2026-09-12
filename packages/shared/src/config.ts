@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { InterlockError } from './errors.js';
@@ -327,6 +328,189 @@ function repoConfigInvalid(problems: string[], path: string): InterlockError {
 /** Standard config file location. Repos may override a subset via `.interlock.json`. */
 export function configPath(dataDir: string = DEFAULT_DATA_DIR): string {
   return join(dataDir, 'config.json');
+}
+
+/**
+ * Where Interlock keeps its state, from the environment or the default.
+ *
+ * One function for the daemon and every client of it, because the config file
+ * lives in this directory and so cannot say where it is: the daemon reads the
+ * variable to find its config, the CLI reads it to find the daemon, and two
+ * readings of one variable are a bug waiting for a rename. An empty value
+ * counts as unset — `INTERLOCK_DATA_DIR= interlockd` is not a request for the
+ * current directory.
+ */
+export function dataDirFrom(env: Readonly<Record<string, string | undefined>>): string {
+  const named = env.INTERLOCK_DATA_DIR;
+  return named === undefined || named === '' ? DEFAULT_DATA_DIR : named;
+}
+
+/**
+ * Sections of the file that are objects, and the keys each may hold.
+ *
+ * Read off the defaults rather than written down again, so this is the same
+ * schema `validateConfig` checks values against and not a second one.
+ */
+const CONFIG_SECTIONS = ['daemon', 'scheduler', 'analyzers', 'sandbox', 'mcp'] as const;
+type ConfigSection = (typeof CONFIG_SECTIONS)[number];
+
+/**
+ * Parse the global config file into the shape `resolveConfig` merges.
+ *
+ * This checks shape; `validateConfig` checks values, which is the split the
+ * repository override file already uses. Shape is what a spread cannot check:
+ * merged as it stands, a file saying `repo` for `repos` watches nothing, one
+ * saying `scheduler.debounce` keeps the default, and `"daemon": "abc"` spreads
+ * three characters into the daemon section — all without a word. An unknown key
+ * is refused because a typo that quietly does nothing is indistinguishable from
+ * a setting that was never applied, and this is the file a user edits on
+ * purpose.
+ *
+ * Unlike the override file, unknown keys are named: this file never reaches the
+ * API or an agent, and "unknown key `repo`" is the whole diagnosis.
+ *
+ * @throws InterlockError `CONFIG_INVALID` listing every problem at once.
+ */
+export function parseConfigFile(
+  source: string,
+  path: string,
+): Omit<DeepPartial<InterlockConfig>, 'dataDir'> {
+  const problems: string[] = [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source.replace(/^\uFEFF/u, ''));
+  } catch {
+    throw configFileInvalid(['file is not valid JSON'], path);
+  }
+  if (!isPlainObject(parsed)) throw configFileInvalid(['top level must be a JSON object'], path);
+
+  // The data dir is where this file was found. A file naming a different one
+  // is contradicting its own location, and honouring it would have the daemon
+  // read its config from one directory and keep its state in another.
+  if ('dataDir' in parsed) {
+    problems.push('dataDir cannot be set here; the data directory is where this file lives');
+  }
+  const allowed = Object.keys(DEFAULT_CONFIG).filter((key) => key !== 'dataDir');
+  // Scanned without `dataDir`: it is known and refused above, which is a better
+  // diagnosis than "unknown key", and listing it among the keys that are
+  // accepted would say the opposite of what the line before just said.
+  const { dataDir: _refused, ...rest } = parsed;
+  nameUnknownKeys(rest, allowed, 'the file', problems);
+
+  const input: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (key === 'dataDir' || !allowed.includes(key)) continue;
+    if ((CONFIG_SECTIONS as readonly string[]).includes(key)) {
+      const section = readSection(key as ConfigSection, value, problems);
+      if (section !== undefined) input[key] = section;
+    } else if (key === 'repos') {
+      input.repos = readRepos(value, problems);
+    } else {
+      input[key] = value;
+    }
+  }
+
+  if (problems.length > 0) throw configFileInvalid(problems, path);
+  return input;
+}
+
+function readSection(
+  name: ConfigSection,
+  value: unknown,
+  problems: string[],
+): Record<string, unknown> | undefined {
+  if (!isPlainObject(value)) {
+    problems.push(`${name} must be a JSON object`);
+    return undefined;
+  }
+  nameUnknownKeys(value, Object.keys(DEFAULT_CONFIG[name]), name, problems);
+  return value;
+}
+
+/**
+ * Repository paths, with `~/` expanded.
+ *
+ * The one relative form a config file legitimately wants: it depends on the
+ * user rather than on the working directory, so it is stable for a daemon in
+ * the way `./repo` is not. `~user/` and a bare `~` are refused with a remedy
+ * that says so, rather than reaching `validateConfig` as merely "not absolute".
+ */
+function readRepos(value: unknown, problems: string[]): unknown {
+  if (!Array.isArray(value)) return value;
+  return value.map((entry: unknown, index) => {
+    if (typeof entry !== 'string') return entry;
+    if (entry === '~' || entry.startsWith('~/')) return join(homedir(), entry.slice(1));
+    if (entry.startsWith('~')) {
+      problems.push(`repos[${String(index)}]: only ~/ is expanded; write the path in full`);
+    }
+    return entry;
+  });
+}
+
+/**
+ * Unknown keys, by name.
+ *
+ * The counterpart of `reportUnknownKeys`, which counts rather than names
+ * because the override file is repository content and its keys reach the API.
+ * This file is the user's own and never leaves the machine, and the name of the
+ * key is the whole diagnosis.
+ */
+function nameUnknownKeys(
+  record: Record<string, unknown>,
+  allowed: readonly string[],
+  scope: string,
+  problems: string[],
+): void {
+  for (const key of Object.keys(record)) {
+    if (!allowed.includes(key)) {
+      problems.push(
+        `${scope} has an unknown key \`${key}\`; expected one of ${allowed.join(', ')}`,
+      );
+    }
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function configFileInvalid(problems: string[], path: string): InterlockError {
+  return new InterlockError('CONFIG_INVALID', `Invalid config file: ${problems.join('; ')}`, {
+    details: { path, problems },
+    remedy: `Edit ${path} and start the daemon again.`,
+  });
+}
+
+/**
+ * The config for a data dir: the file in it, over the defaults.
+ *
+ * A missing file is the normal first start and means the defaults. A file that
+ * is there and cannot be read is not — a daemon that silently ran on defaults
+ * over a config it could not open would look exactly like one that was never
+ * configured, and the repositories it was meant to watch would go unwatched
+ * without a word.
+ *
+ * @throws InterlockError `CONFIG_INVALID` for a file that cannot be read,
+ *         cannot be parsed, or holds a value `validateConfig` refuses.
+ */
+export function loadConfig(dataDir: string): InterlockConfig {
+  const path = configPath(dataDir);
+  let source: string;
+  try {
+    source = readFileSync(path, 'utf8');
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? null;
+    if (code === 'ENOENT') return resolveConfig({ dataDir });
+    throw new InterlockError('CONFIG_INVALID', 'The config file could not be read', {
+      cause: error,
+      details: { path, code },
+      remedy: `Check that ${path} is a file readable by this user, or remove it to run on the defaults.`,
+    });
+  }
+  // The parser's return type cannot carry `dataDir`, so there is no order of
+  // these two in which the file could win — which is the property, and it is
+  // in the signature rather than in a spread order nothing can observe.
+  return resolveConfig({ ...parseConfigFile(source, path), dataDir });
 }
 
 /**

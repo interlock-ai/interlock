@@ -103,9 +103,18 @@ jobs:
   # which starts a different conversation. No retry, on purpose: a flake here
   # is a write that happens sometimes, and that is the finding, not noise.
   untouched:
-    name: user repositories untouched
-    runs-on: ubuntu-latest
+    name: user repositories untouched (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      # macOS earns a cell here that it does not elsewhere. The one failure
+      # this suite has produced was a lock a newer git leaves behind after a
+      # commit, and Ubuntu's git predates that behaviour — so the check meant
+      # to be the visible one would run only on the platform least able to see
+      # what it exists to catch.
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

@@ -600,6 +600,17 @@ export function createGitRunner(options: GitRunnerOptions = {}): GitRunner {
         'core.splitIndex=false',
         '-c',
         `core.hooksPath=${devNull}`,
+        // Auto-maintenance is a background process a repository's own git
+        // starts after `commit`, `merge`, `rebase`, `am` and `fetch`, and since
+        // git 2.47 it detaches — holding `objects/maintenance.lock` after the
+        // command that started it has returned. No verb the runner allows on a
+        // user repository triggers it today; switching it off here makes that
+        // a property of the runner rather than of the verb list, so a verb
+        // added later cannot leave a detached writer in someone's repository.
+        '-c',
+        'maintenance.auto=false',
+        '-c',
+        'gc.auto=0',
         ...args,
       ];
       const startedAt = Date.now();

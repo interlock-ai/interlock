@@ -91,6 +91,27 @@ describe('interlockd', () => {
     expect(existsSync(runtimePath(dataDir))).toBe(false);
   }, 30_000);
 
+  it('refuses a relative INTERLOCK_DATA_DIR with a remedy naming the variable', async () => {
+    const child = spawn(TSX, ['--tsconfig', TSCONFIG, MAIN], {
+      env: { ...process.env, INTERLOCK_DATA_DIR: './relative-data' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const run = await finished(child);
+
+    expect(run.code).toBe(1);
+    const record = JSON.parse(run.stderr.trim().split('\n').at(-1) ?? '{}') as {
+      code?: string;
+      msg?: string;
+      remedy?: string;
+    };
+    expect(record.code).toBe('CONFIG_INVALID');
+    expect(record.msg).toContain('INTERLOCK_DATA_DIR');
+    // Not the store's remedy about `:memory:`, which names nothing the user set.
+    expect(record.remedy).toContain('INTERLOCK_DATA_DIR');
+    expect(record.remedy).not.toContain('memory');
+    expect(existsSync(join(ROOT, 'relative-data'))).toBe(false);
+  }, 30_000);
+
   it('watches the repositories the config names, and stops cleanly on SIGTERM', async () => {
     const root = join(base, 'repo');
     execFileSync('git', ['init', '-q', '-b', 'main', root], { stdio: 'pipe' });

@@ -342,7 +342,18 @@ export function configPath(dataDir: string = DEFAULT_DATA_DIR): string {
  */
 export function dataDirFrom(env: Readonly<Record<string, string | undefined>>): string {
   const named = env.INTERLOCK_DATA_DIR;
-  return named === undefined || named === '' ? DEFAULT_DATA_DIR : named;
+  if (named === undefined || named === '') return DEFAULT_DATA_DIR;
+  // Refused here, where the variable was read, rather than left to whatever
+  // opens the directory first: a relative value would otherwise be reported by
+  // the store, three layers down, with a remedy about database paths that
+  // names nothing the user touched.
+  if (!named.startsWith('/')) {
+    throw new InterlockError('CONFIG_INVALID', 'INTERLOCK_DATA_DIR must be an absolute path', {
+      details: { INTERLOCK_DATA_DIR: named },
+      remedy: `Set INTERLOCK_DATA_DIR to a full path, e.g. ${DEFAULT_DATA_DIR}.`,
+    });
+  }
+  return named;
 }
 
 /**
@@ -490,6 +501,13 @@ function configFileInvalid(problems: string[], path: string): InterlockError {
  * configured, and the repositories it was meant to watch would go unwatched
  * without a word.
  *
+ * A plain read, following symlinks and unbounded, unlike the two files this
+ * shares a directory with. The override file gets `O_NOFOLLOW` and a size cap
+ * because a repository writes it; the token file gets `O_NOFOLLOW` because its
+ * mode is checked and tightened through the same descriptor and a symlink would
+ * redirect the tightening. This file is the user's own, is read once, and has
+ * no mode to change — there is nothing here for either to protect.
+ *
  * @throws InterlockError `CONFIG_INVALID` for a file that cannot be read,
  *         cannot be parsed, or holds a value `validateConfig` refuses.
  */
@@ -584,6 +602,11 @@ export function validateConfig(config: InterlockConfig): string[] {
 
   if (typeof config.dataDir !== 'string' || config.dataDir === '') {
     problems.push('dataDir must be a non-empty path');
+  } else if (!config.dataDir.startsWith('/')) {
+    // The same rule the repositories get, for the same reason: a daemon's
+    // working directory is whatever started it, and state kept relative to
+    // that is state kept somewhere different on every start.
+    problems.push(`dataDir must be absolute: ${config.dataDir}`);
   }
   if (!(LOG_LEVELS as readonly string[]).includes(config.logLevel)) {
     problems.push(`logLevel must be one of ${LOG_LEVELS.join(', ')}`);

@@ -72,6 +72,11 @@ function problemsFrom(source: string): string[] {
 }
 
 describe('validateConfig', () => {
+  it('refuses a relative data dir, as it refuses a relative repository', () => {
+    const problems = validateConfig({ ...DEFAULT_CONFIG, dataDir: 'relative/data' });
+    expect(problems).toContain('dataDir must be absolute: relative/data');
+  });
+
   const { scheduler: S, sandbox: B, mcp: M } = DEFAULT_CONFIG;
 
   it('refuses a value of the wrong type before testing its range', () => {
@@ -252,6 +257,22 @@ describe('dataDirFrom', () => {
     // `INTERLOCK_DATA_DIR= interlockd` is not a request for the current
     // directory.
     expect(dataDirFrom({ INTERLOCK_DATA_DIR: '' })).toBe(DEFAULT_DATA_DIR);
+  });
+
+  it('refuses a relative path and names the variable, not the store', () => {
+    // Left to whatever opens the directory first, this was reported by the
+    // store with a remedy about database paths and `:memory:`.
+    try {
+      dataDirFrom({ INTERLOCK_DATA_DIR: './relative' });
+    } catch (error) {
+      if (!isInterlockError(error)) throw error;
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.message).toContain('INTERLOCK_DATA_DIR');
+      expect(error.remedy).toContain('INTERLOCK_DATA_DIR');
+      expect(error.remedy).not.toContain('memory');
+      return;
+    }
+    throw new Error('expected the relative path to be refused');
   });
 });
 

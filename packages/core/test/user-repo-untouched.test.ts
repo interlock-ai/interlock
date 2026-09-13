@@ -11,7 +11,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ulid } from '@interlock/shared';
+import { isInterlockError, ulid } from '@interlock/shared';
 import type { SnapshotId } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -90,6 +90,7 @@ describe('user repositories are never modified', () => {
     const repo = await describeRepo(handle, { runner, dataDir });
     const branches = await listBranchRefs(handle, repo.id, { runner });
     expect(branches.length).toBeGreaterThan(0);
+    let diffed = 0;
 
     for (const branch of branches) {
       let snapshot: { id: SnapshotId; treeOid: string } | undefined;
@@ -111,9 +112,15 @@ describe('user repositories are never modified', () => {
       let mergeBaseSha: string | null;
       try {
         mergeBaseSha = await mergeBase(handle, branch.headSha, repo.defaultBranch, { runner });
-      } catch {
-        // A rebase or a detached head can leave no default branch to compare
-        // against; the pipeline publishes without a diff there, and so does this.
+      } catch (error) {
+        // Only the one failure the pipeline itself excuses: a default branch
+        // that does not resolve, which git reports as a failed command that is
+        // not an infrastructure problem. A timeout or a missing git is infra,
+        // and swallowing it here would leave the rest of this loop unexercised
+        // while the suite stayed green.
+        if (!isInterlockError(error) || error.code !== 'GIT_COMMAND_FAILED' || error.infra) {
+          throw error;
+        }
         mergeBaseSha = null;
       }
       if (mergeBaseSha === null) continue;
@@ -123,7 +130,12 @@ describe('user repositories are never modified', () => {
       if (snapshot !== undefined) {
         await extractChangeSet(handle, branch, mergeBaseSha, { runner, snapshot });
       }
+      diffed += 1;
     }
+
+    // Every fixture has a default branch that resolves, so a cycle that diffed
+    // nothing exercised half the surface it claims to and must not pass.
+    expect(diffed).toBeGreaterThan(0);
   };
 
   /** Capture, run, capture, and fail with the diagnosis rather than a boolean. */
@@ -212,6 +224,23 @@ describe('user repositories are never modified', () => {
       rmSync(join(root, object!));
       const diff = diffState(before, captureState(root));
       expect(diff.removed).toStrictEqual([object]);
+    });
+
+    it('allows nothing under objects but loose objects and packs', () => {
+      // `alternates` redirects where git reads objects from, and is exactly
+      // the file a subtle corruption bug would produce. The allowance is for
+      // what a snapshot writes, not for the directory.
+      const before = captureState(root);
+      mkdirSync(join(root, '.git', 'objects', 'info'), { recursive: true });
+      writeFileSync(join(root, '.git', 'objects', 'info', 'alternates'), '/elsewhere\n');
+      writeFileSync(join(root, '.git', 'objects', 'tmp_obj_abc'), '');
+      writeFileSync(join(root, '.git', 'objects', 'maintenance.lock'), '');
+      const diff = diffState(before, captureState(root));
+      expect(diff.added).toStrictEqual([
+        join('.git', 'objects', 'info', 'alternates'),
+        join('.git', 'objects', 'maintenance.lock'),
+        join('.git', 'objects', 'tmp_obj_abc'),
+      ]);
     });
 
     it('names an object whose content changed, which is corruption', () => {
@@ -314,6 +343,13 @@ describe('user repositories are never modified', () => {
     writeFileSync(join(root, 'b.txt'), 'unstaged\n');
     writeFileSync(join(root, 'new file.txt'), 'untracked\n');
     writeFileSync(join(root, 'run.sh'), '#!/bin/sh\n', { mode: 0o755 });
+    // Names that are pathspec magic or look like flags. These reach the scoped
+    // capture through the dirty-state lists exactly as the watcher's paths do,
+    // and a capture that read `:(exclude)` as magic would drop the file and
+    // produce a tree that is wrong rather than merely stale — which the
+    // whole-tree comparison inside the cycle is there to catch.
+    writeFileSync(join(root, ':(exclude)a.txt'), 'magic\n');
+    writeFileSync(join(root, '-dash.txt'), 'flag\n');
 
     await assertUntouched([root]);
   });

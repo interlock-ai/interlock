@@ -13,10 +13,16 @@ import { join, relative, sep } from 'node:path';
  * the config, the stash, a rebase in progress, submodule git dirs — and records
  * content, mode and mtime for each.
  *
- * One directory is allowed to grow. A snapshot writes a tree into `objects/`,
- * and the object store is append-only: `gc` reclaims what nothing references,
- * and a new object changes no existing byte. An object that changed or vanished
- * is still a write.
+ * Two places are allowed to grow, and only two: loose objects under
+ * `objects/xx/` and packs under `objects/pack/`. That is what a snapshot writes
+ * and what the object store's append-only contract covers — `gc` reclaims what
+ * nothing references, and a new object changes no existing byte. Nothing else
+ * under `objects/` is covered by it: `objects/info/alternates` redirects where
+ * git reads objects from, a `tmp_obj_*` left at the top is a write that never
+ * finished, and a lock file is a lock file. The allowance enumerates what is
+ * legitimate rather than exempting the directory, for the same reason the walk
+ * covers everything rather than a list. An object that changed or vanished is
+ * still a write.
  *
  * One more thing is allowed there, and it was found by this suite rather than
  * anticipated: writing an object that already exists makes git `utime` the
@@ -49,6 +55,11 @@ export interface StateDiff {
  * `lstat`, so a symlink is recorded as a link to a target rather than followed
  * — following one would record the state of something outside the tree, and
  * replacing a link with a copy of its target would go unnoticed.
+ *
+ * The tree is assumed quiescent: nothing writing while this walks. A capture
+ * racing a writer throws on a file that vanished between `readdir` and `lstat`,
+ * which is the right failure — loud, and pointing at the writer — rather than
+ * a diff that blames whichever side the race landed on.
  */
 export function captureState(root: string): RepoState {
   const state = new Map<string, FileState>();
@@ -123,14 +134,22 @@ function same(a: FileState, b: FileState, freshenable: boolean): boolean {
 }
 
 /**
- * Inside the object store of the git dir, or of a submodule's under `modules/`.
+ * A loose object or a pack in the object store of the git dir, or of a
+ * submodule's under `modules/`.
  *
  * Anchored on `.git` so a worktree directory that happens to be called
- * `objects` is not mistaken for one: additions there are writes.
+ * `objects` is not mistaken for one, and on the last `objects` segment so a
+ * submodule named `objects` does not shift the match. Only the two shapes git
+ * writes for an object qualify; `info/`, a top-level temp file and a lock are
+ * not objects and get no allowance.
  */
 function isObject(path: string): boolean {
   const parts = path.split(sep);
-  return parts[0] === '.git' && parts.includes('objects');
+  if (parts[0] !== '.git') return false;
+  const index = parts.lastIndexOf('objects');
+  if (index === -1) return false;
+  const bucket = parts[index + 1] ?? '';
+  return parts.length > index + 2 && (bucket === 'pack' || /^[0-9a-f]{2}$/u.test(bucket));
 }
 
 /**

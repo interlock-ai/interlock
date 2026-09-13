@@ -2,7 +2,7 @@ import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
-  ALLOWED_CALL_SITE,
+  ALLOWED_CALL_SITES,
   findCallSites,
   isShippedSource,
   readShippedSource,
@@ -59,12 +59,22 @@ describe('single git call site', () => {
       expect(site?.text).toContain('child_process');
     });
 
-    it('allows the runner and nothing else', () => {
+    it('allows the listed sites and nothing else', () => {
       const content = "import { execFile } from 'node:child_process';";
-      expect(findCallSites([{ path: ALLOWED_CALL_SITE, content }])).toHaveLength(0);
+      for (const path of ALLOWED_CALL_SITES) {
+        expect(findCallSites([{ path, content }]), path).toHaveLength(0);
+      }
       expect(
         findCallSites([{ path: join('packages', 'core', 'src', 'git', 'other.ts'), content }]),
       ).toHaveLength(1);
+    });
+
+    it('scans every extension that ships, not only .ts', () => {
+      const content = "import { execFile } from 'node:child_process';";
+      for (const name of ['a.mts', 'a.cts', 'a.js', 'a.mjs', 'a.cjs']) {
+        const path = join('packages', 'daemon', 'src', name);
+        expect(findCallSites([{ path, content }]), name).toHaveLength(1);
+      }
     });
 
     it('leaves tests, declarations and scripts alone', () => {
@@ -72,7 +82,9 @@ describe('single git call site', () => {
       for (const path of [
         join('packages', 'core', 'test', 'fixture.ts'),
         join('packages', 'core', 'src', 'git', 'thing.test.ts'),
+        join('packages', 'core', 'src', 'git', 'thing.test.mts'),
         join('packages', 'core', 'src', 'types.d.ts'),
+        join('packages', 'core', 'src', 'types.d.mts'),
         join('scripts', 'bench.ts'),
         join('eval', 'run.ts'),
         // A `src` directory outside `packages/` is still not shipped.
@@ -93,7 +105,12 @@ describe('single git call site', () => {
     const files = readShippedSource(ROOT);
     // The walk found the tree it was pointed at, rather than an empty directory
     // that would pass for the wrong reason.
-    expect(files.some((file) => file.path === ALLOWED_CALL_SITE)).toBe(true);
+    for (const site of ALLOWED_CALL_SITES) {
+      expect(
+        files.some((file) => file.path === site),
+        site,
+      ).toBe(true);
+    }
     expect(files.length).toBeGreaterThan(20);
 
     const sites = findCallSites(files);

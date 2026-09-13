@@ -85,12 +85,13 @@ describe('user repositories are never modified', () => {
    * whole-tree capture produced, and both write objects. The change set runs
    * against the snapshot as well as against the head.
    */
-  const cycle = async (root: string): Promise<void> => {
+  const cycle = async (root: string): Promise<{ diffed: number; excused: number }> => {
     const handle: UserRepo = await openUserRepo(root, { runner });
     const repo = await describeRepo(handle, { runner, dataDir });
     const branches = await listBranchRefs(handle, repo.id, { runner });
     expect(branches.length).toBeGreaterThan(0);
     let diffed = 0;
+    let excused = 0;
 
     for (const branch of branches) {
       let snapshot: { id: SnapshotId; treeOid: string } | undefined;
@@ -114,13 +115,14 @@ describe('user repositories are never modified', () => {
         mergeBaseSha = await mergeBase(handle, branch.headSha, repo.defaultBranch, { runner });
       } catch (error) {
         // Only the one failure the pipeline itself excuses: a default branch
-        // that does not resolve, which git reports as a failed command that is
-        // not an infrastructure problem. A timeout or a missing git is infra,
-        // and swallowing it here would leave the rest of this loop unexercised
-        // while the suite stayed green.
+        // that does not resolve, which `mergeBase` raises as a failed command
+        // that is not infrastructure. A timeout or a missing git rejects from
+        // the runner with `infra` set, and swallowing that here would leave the
+        // rest of this loop unexercised while the suite stayed green.
         if (!isInterlockError(error) || error.code !== 'GIT_COMMAND_FAILED' || error.infra) {
           throw error;
         }
+        excused += 1;
         mergeBaseSha = null;
       }
       if (mergeBaseSha === null) continue;
@@ -133,15 +135,16 @@ describe('user repositories are never modified', () => {
       diffed += 1;
     }
 
-    // Every fixture has a default branch that resolves, so a cycle that diffed
-    // nothing exercised half the surface it claims to and must not pass.
-    expect(diffed).toBeGreaterThan(0);
+    return { diffed, excused };
   };
 
   /** Capture, run, capture, and fail with the diagnosis rather than a boolean. */
   const assertUntouched = async (roots: readonly string[]): Promise<void> => {
     const before = new Map<string, RepoState>(roots.map((root) => [root, captureState(root)]));
-    await cycle(roots[0]!);
+    const outcome = await cycle(roots[0]!);
+    // Every fixture here has a default branch that resolves, so a cycle that
+    // diffed nothing exercised half the surface it claims to and must not pass.
+    expect(outcome.diffed).toBeGreaterThan(0);
     for (const root of roots) {
       const after = captureState(root);
       const diff = diffState(before.get(root)!, after);
@@ -406,6 +409,30 @@ describe('user repositories are never modified', () => {
     git(root, 'commit', '-qm', 'add submodule');
 
     await assertUntouched([root, linked]);
+  });
+
+  it('excuses exactly a default branch that does not resolve, and nothing else', async () => {
+    // A repository whose `origin/HEAD` names a branch nobody fetched, or a
+    // detached head with no `main`: the pipeline publishes without a diff, and
+    // the cycle takes the same path. Reached on purpose, because a catch that
+    // no fixture reaches is a comment about behaviour rather than a test of it.
+    // Detached with no `origin`, so the default falls back to a literal `main`
+    // that is gone; the detached worktree is skipped, and the bare `topic` ref
+    // is what gets compared against a branch that does not exist.
+    const root = join(base, 'repo');
+    init(root);
+    commit(root, 'a.txt', 'a\n', 'one');
+    git(root, 'branch', 'topic');
+    git(root, 'checkout', '-q', '--detach', 'HEAD');
+    git(root, 'branch', '-D', 'main');
+    writeFileSync(join(root, 'a.txt'), 'dirty\n');
+
+    const before = captureState(root);
+    const outcome = await cycle(root);
+    const after = captureState(root);
+    const diff = diffState(before, after);
+    expect(isClean(diff), describeDiff(diff, before, after)).toBe(true);
+    expect(outcome).toStrictEqual({ diffed: 0, excused: 1 });
   });
 
   it('holds no lock files in the user repo after the run', async () => {

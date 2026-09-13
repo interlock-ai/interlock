@@ -132,8 +132,11 @@ jobs:
         run: git --version
 
       # The same script a developer runs, so the two cannot check different
-      # things. Its output on failure is the diagnosis: every path that changed,
-      # and how.
+      # things. It covers both halves of the promise — nothing written, and
+      # nothing spawned from anywhere but the listed sites — and runs its files
+      # one at a time: the daemon half is timing-driven, and a diagnosis that
+      # reproduces is worth more than the seconds parallelism would save. Its
+      # output on failure is the diagnosis: every path that changed, and how.
       - name: User repositories untouched
         run: pnpm test:untouched
 

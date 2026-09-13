@@ -396,7 +396,8 @@ function buildEnv(indexFile: string | undefined): NodeJS.ProcessEnv {
   // Repository-wide policy, not one caller's accommodation: it applies to every
   // command the runner runs. A call site wanting a glob or a magic pathspec
   // would silently match nothing rather than fail, so that call site has to
-  // expand the pattern itself.
+  // expand the pattern itself — never by unsetting this, which would hand the
+  // first paragraph back to every other caller at once.
   env.GIT_LITERAL_PATHSPECS = '1';
   // Read commands must never take `index.lock`, or they stall the user's own git.
   env.GIT_OPTIONAL_LOCKS = '0';

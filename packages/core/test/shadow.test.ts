@@ -6,7 +6,9 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  readdirSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -480,6 +482,91 @@ describe('ensureShadow', () => {
       const error = await rejection(ensureShadow(notGit, { runner, dataDir, repoId }));
 
       expect(error.code).toBe('GIT_COMMAND_FAILED');
+    });
+  });
+
+  describe('a data dir inside the repository', () => {
+    /** Refused with nothing written: no data dir, and the checkout as git sees it. */
+    const expectRefused = async (user: UserRepo, at: string, checkout: string): Promise<void> => {
+      const status = gitIn(checkout, 'status', '--porcelain', '--ignored');
+
+      const error = await rejection(ensureShadow(user, { runner, dataDir: at, repoId }));
+
+      expect(error.code).toBe('SHADOW_UNAVAILABLE');
+      expect(error.infra).toBe(true);
+      expect(existsSync(at)).toBe(false);
+      expect(gitIn(checkout, 'status', '--porcelain', '--ignored')).toBe(status);
+    };
+
+    it('is refused inside the checkout', async () => {
+      await expectRefused(repo, join(dir, 'interlock-data'), dir);
+    });
+
+    it('is refused inside its git directory', async () => {
+      await expectRefused(repo, join(dir, '.git', 'interlock-data'), dir);
+    });
+
+    it('is refused inside the main checkout of a linked worktree', async () => {
+      // The linked worktree is the origin; the main checkout is named only by
+      // the store the shadow would borrow.
+      git('branch', 'feature');
+      const linked = join(base, 'linked');
+      git('worktree', 'add', '-q', linked, 'feature');
+      const worktreeRepo: UserRepo = {
+        kind: 'user',
+        rootPath: linked,
+        gitDir: join(dir, '.git', 'worktrees', 'linked'),
+      };
+
+      await expectRefused(worktreeRepo, join(dir, 'interlock-data'), dir);
+    });
+
+    it('is refused inside a git directory kept apart from the checkout', async () => {
+      const separate = join(base, 'separate');
+      const apart = join(base, 'apart.git');
+      execFileSync('git', ['init', '-q', '-b', 'main', `--separate-git-dir=${apart}`, separate], {
+        stdio: 'pipe',
+      });
+      const separateRepo: UserRepo = { kind: 'user', rootPath: separate, gitDir: apart };
+
+      await expectRefused(separateRepo, join(apart, 'interlock-data'), separate);
+    });
+
+    it('is refused when a symlink leads into the checkout', async () => {
+      mkdirSync(join(dir, 'inside'));
+      const link = join(base, 'link');
+      symlinkSync(join(dir, 'inside'), link);
+
+      const error = await rejection(ensureShadow(repo, { runner, dataDir: link, repoId }));
+
+      expect(error.code).toBe('SHADOW_UNAVAILABLE');
+      expect(readdirSync(join(dir, 'inside'))).toStrictEqual([]);
+    });
+
+    it('is refused on refresh too, for a clone a symlink has since moved inside', async () => {
+      const outside = join(base, 'outside');
+      mkdirSync(outside);
+      mkdirSync(join(dir, 'inside'));
+      symlinkSync(outside, join(base, 'link'));
+      await ensureShadow(repo, { runner, dataDir: join(base, 'link'), repoId });
+      rmSync(join(base, 'link'));
+      symlinkSync(join(dir, 'inside'), join(base, 'link'));
+      const calls = recording();
+
+      const error = await rejection(
+        ensureShadow(repo, { runner: calls.runner, dataDir: join(base, 'link'), repoId }),
+      );
+
+      expect(error.code).toBe('SHADOW_UNAVAILABLE');
+      expect(readdirSync(join(dir, 'inside'))).toStrictEqual([]);
+      // Refused before the shadow is asked anything, let alone written.
+      expect(calls.calls.map((args) => args[0])).toStrictEqual(['rev-parse']);
+    });
+
+    it('is accepted beside the checkout, under a name the checkout’s is a prefix of', async () => {
+      const shadow = await ensureShadow(repo, { runner, dataDir: `${dir}-data`, repoId });
+
+      expect(shadow.rootPath).toBe(shadowPathFor(repoId, `${dir}-data`));
     });
   });
 

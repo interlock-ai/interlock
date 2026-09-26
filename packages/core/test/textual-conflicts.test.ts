@@ -1,0 +1,1318 @@
+import { execFileSync } from 'node:child_process';
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { InterlockError, REDACTED, createLogger, silentLogger, ulid } from '@interlock/shared';
+import type {
+  BranchRefId,
+  ChangeSet,
+  ChangeSetId,
+  Evidence,
+  Finding,
+  LogRecord,
+  MergeConflictEvidence,
+  RepoId,
+  SpanEvidence,
+  SpeculativeRunId,
+} from '@interlock/shared';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { textualAnalyzer } from '../src/analyzers/textual.js';
+import type { AnalyzerContext, AnalyzerOutcome } from '../src/analyzers/analyzer.js';
+import { createGitRunner } from '../src/git/repo-handle.js';
+import type { GitRunner, UserRepo } from '../src/git/repo-handle.js';
+import { ensureShadow } from '../src/git/shadow.js';
+import {
+  MAX_BLOB_BYTES,
+  MAX_EXCERPT_CHARS,
+  MAX_EXCERPT_LINES,
+  MAX_FINDINGS_PER_RUN,
+  MAX_SPANS_PER_SIDE,
+  classifyTextualConflicts,
+  excerptOf,
+  textualFindingKey,
+} from '../src/merge/conflict-classifier.js';
+import { speculativeMerge } from '../src/merge/speculative-merge.js';
+import type { ConflictStage, SpeculativeMergeRequest } from '../src/merge/speculative-merge.js';
+import { rejection } from './support/rejection.js';
+import { TEXTUAL_FIXTURES } from './support/textual-fixtures.js';
+import type { BranchChange } from './support/textual-fixtures.js';
+
+/**
+ * Textual classification, end to end: real repositories, a real shadow, the
+ * real merge, and the analyzer as the pipeline will call it.
+ *
+ * Spans are asserted against each branch's own file as git holds it, never
+ * against the merged file — the whole point of a span is that an agent can open
+ * its own copy at those lines.
+ */
+describe('textual conflicts', () => {
+  let base: string;
+  let dir: string;
+  let dataDir: string;
+  const runner = createGitRunner();
+  const branchA = ulid<BranchRefId>();
+  const branchB = ulid<BranchRefId>();
+
+  const gitIn = (where: string, ...args: string[]): string =>
+    execFileSync('git', ['-C', where, ...args], { stdio: 'pipe', encoding: 'utf8' });
+  const git = (...args: string[]): string => gitIn(dir, ...args);
+  const head = (): string => git('rev-parse', 'HEAD').trim();
+
+  const write = (path: string, content: string | Buffer): void => {
+    mkdirSync(join(dir, path, '..'), { recursive: true });
+    writeFileSync(join(dir, path), content);
+  };
+
+  const apply = (change: BranchChange): void => {
+    for (const [from, to] of change.rename ?? []) git('mv', from, to);
+    for (const [path, content] of Object.entries(change.write ?? {})) write(path, content);
+    for (const path of change.remove ?? []) git('rm', '-q', path);
+  };
+
+  const commit = (message: string): string => {
+    git('add', '-A');
+    git('commit', '-qm', message);
+    return head();
+  };
+
+  /** A base commit, two branches off it, and a shadow that can see all three. */
+  const pair = async (
+    setup: () => void,
+    one: () => void,
+    two: () => void,
+  ): Promise<SpeculativeMergeRequest> => {
+    setup();
+    const mergeBaseSha = commit('base');
+    git('checkout', '-qb', 'one');
+    one();
+    const commitA = commit('one');
+    git('checkout', '-q', mergeBaseSha);
+    git('checkout', '-qb', 'two');
+    two();
+    const commitB = commit('two');
+    git('checkout', '-q', 'main');
+    const repo: UserRepo = { kind: 'user', rootPath: dir, gitDir: join(dir, '.git') };
+    const shadow = await ensureShadow(repo, {
+      runner,
+      dataDir,
+      repoId: '01JBQ0000000000000000TEXT' as RepoId,
+    });
+    return { shadow, commitA, commitB, mergeBaseSha };
+  };
+
+  const changeSet = (branchRefId: BranchRefId, request: SpeculativeMergeRequest): ChangeSet => ({
+    id: ulid<ChangeSetId>(),
+    branchRefId,
+    snapshotId: null,
+    mergeBaseSha: request.mergeBaseSha,
+    headSha: branchRefId === branchA ? request.commitA : request.commitB,
+    files: [],
+    computedAt: new Date().toISOString(),
+  });
+
+  const context = async (
+    request: SpeculativeMergeRequest,
+    using: GitRunner = runner,
+  ): Promise<AnalyzerContext> => ({
+    runId: ulid<SpeculativeRunId>(),
+    branchA,
+    branchB,
+    changeSetA: changeSet(branchA, request),
+    changeSetB: changeSet(branchB, request),
+    mergeRequest: request,
+    merged: await speculativeMerge(request, { runner }),
+    slot: null,
+    runner: using,
+    logger: silentLogger,
+    signal: new AbortController().signal,
+  });
+
+  const analyze = async (request: SpeculativeMergeRequest): Promise<AnalyzerOutcome> =>
+    textualAnalyzer.analyze(await context(request));
+
+  const provenanceOf = (finding: Finding): MergeConflictEvidence => {
+    const found = finding.evidence.filter(
+      (e): e is MergeConflictEvidence => e.type === 'merge-conflict',
+    );
+    expect(found).toHaveLength(1);
+    return found[0]!;
+  };
+  const spansOf = (finding: Finding, branch: BranchRefId): SpanEvidence[] =>
+    finding.evidence.filter(
+      (e: Evidence): e is SpanEvidence => e.type === 'span' && e.branchRefId === branch,
+    );
+
+  /** The lines a span names, read from that branch's own commit. */
+  const linesAt = (commit: string, span: SpanEvidence): string[] =>
+    gitIn(dir, 'cat-file', 'blob', `${commit}:${span.path}`)
+      .split('\n')
+      .slice(span.startLine - 1, span.endLine);
+
+  beforeEach(() => {
+    // git answers with fully-resolved paths, and on macOS /var is a symlink to
+    // /private/var, so the fixture works in canonical form throughout.
+    base = realpathSync(mkdtempSync(join(tmpdir(), 'interlock-textual-')));
+    dir = join(base, 'user');
+    dataDir = join(base, 'data');
+    execFileSync('git', ['init', '-q', '-b', 'main', dir], { stdio: 'pipe' });
+    git('config', 'user.name', 'Interlock Test');
+    git('config', 'user.email', 'test@example.invalid');
+    git('config', 'maintenance.auto', 'false');
+    git('config', 'gc.auto', '0');
+  });
+
+  afterEach(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  describe.each(TEXTUAL_FIXTURES)('$name', (fixture) => {
+    const build = (): Promise<SpeculativeMergeRequest> =>
+      pair(
+        () => {
+          for (const [path, content] of Object.entries(fixture.base)) write(path, content);
+        },
+        () => apply(fixture.one),
+        () => apply(fixture.two),
+      );
+
+    if (fixture.expected === null) {
+      it('merges cleanly and raises nothing', async () => {
+        const request = await build();
+        const ctx = await context(request);
+
+        expect(ctx.merged.clean).toBe(true);
+        expect(textualAnalyzer.appliesTo(ctx)).toBe(false);
+        expect(await textualAnalyzer.analyze(ctx)).toEqual({ verdict: 'clean', findings: [] });
+      });
+      return;
+    }
+
+    const expected = fixture.expected;
+    it(`is caught by the ${expected.analyzer} analyzer as ${expected.class}`, async () => {
+      const request = await build();
+      const ctx = await context(request);
+      expect(textualAnalyzer.appliesTo(ctx)).toBe(true);
+
+      const outcome = await textualAnalyzer.analyze(ctx);
+
+      expect(outcome.verdict).toBe('findings');
+      expect(outcome.findings).toHaveLength(1);
+      const finding = outcome.findings[0]!;
+      expect(finding).toMatchObject({
+        runId: ctx.runId,
+        kind: expected.analyzer,
+        rule: expected.class,
+        confidence: 1,
+        status: 'open',
+        attribution: { branchA, branchB, originBranch: null },
+        resolvedAt: null,
+      });
+      expect(finding.attribution.rationale).not.toBe('');
+
+      const provenance = provenanceOf(finding);
+      expect(provenance).toMatchObject({
+        mergeBaseSha: request.mergeBaseSha,
+        commitA: request.commitA,
+        commitB: request.commitB,
+        path: expected.path,
+      });
+      // Tokens only: the `Auto-merging` notes beside them are not conflicts.
+      expect(provenance.conflictTypes.length).toBeGreaterThan(0);
+      expect(provenance.conflictTypes.every((t) => t.startsWith('CONFLICT ('))).toBe(true);
+      expect(provenance.sideA?.path ?? null).toBe(expected.pathA);
+      expect(provenance.sideB?.path ?? null).toBe(expected.pathB);
+
+      const check = (
+        branch: BranchRefId,
+        commit: string,
+        want: readonly [number, number] | null,
+        path: string | null,
+      ): void => {
+        const spans = spansOf(finding, branch);
+        if (want === null) {
+          expect(spans).toEqual([]);
+          return;
+        }
+        expect(spans).toHaveLength(1);
+        const span = spans[0]!;
+        expect(span.path).toBe(path);
+        expect([span.startLine, span.endLine]).toEqual(want);
+        // The excerpt is the branch's own lines, and the labelled symbol is in them.
+        expect(span.excerpt).toBe(linesAt(commit, span).join('\n'));
+        expect(span.excerpt).toContain(expected.symbol);
+      };
+      check(branchA, request.commitA, expected.spanA, expected.pathA);
+      check(branchB, request.commitB, expected.spanB, expected.pathB);
+    });
+  });
+
+  describe('spans', () => {
+    it('are placed in each branch’s own file, not the merged one', async () => {
+      // Both sides shift the conflict by different amounts, in opposite
+      // directions, with changes that merge cleanly: the region sits at a line
+      // in the merged file that neither branch has it on.
+      const body = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`);
+      const request = await pair(
+        () => write('f.txt', `${body.join('\n')}\n`),
+        () => {
+          const lines = [...body];
+          lines[19] = 'ours';
+          lines.splice(1, 0, 'added 1', 'added 2', 'added 3', 'added 4', 'added 5');
+          write('f.txt', `${lines.join('\n')}\n`);
+        },
+        () => {
+          const lines = [...body];
+          lines[19] = 'theirs';
+          lines.splice(8, 3);
+          write('f.txt', `${lines.join('\n')}\n`);
+        },
+      );
+
+      const [finding] = (await analyze(request)).findings;
+      const [a] = spansOf(finding!, branchA);
+      const [b] = spansOf(finding!, branchB);
+
+      expect(a).toMatchObject({ startLine: 25, endLine: 25, excerpt: 'ours' });
+      expect(b).toMatchObject({ startLine: 17, endLine: 17, excerpt: 'theirs' });
+      const merged = await speculativeMerge(request, { runner });
+      expect(merged.conflictBlocks[0]!.startLine).not.toBe(25);
+      expect(merged.conflictBlocks[0]!.startLine).not.toBe(17);
+    });
+
+    it('give a side that deleted the lines an empty span where they were', async () => {
+      const request = await pair(
+        () => write('f.txt', 'a\nb\nc\nd\n'),
+        () => write('f.txt', 'a\nd\n'),
+        () => write('f.txt', 'a\nB\nc\nd\n'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('overlapping-edit');
+      expect(spansOf(finding!, branchA)).toMatchObject([{ startLine: 2, endLine: 1, excerpt: '' }]);
+      expect(spansOf(finding!, branchB)).toMatchObject([{ startLine: 2, endLine: 3 }]);
+    });
+
+    it('cover regions on the first and the last line of a file', async () => {
+      const request = await pair(
+        () => write('f.txt', 'first\nmiddle 1\nmiddle 2\nmiddle 3\nmiddle 4\nlast\n'),
+        () => write('f.txt', 'FIRST-A\nmiddle 1\nmiddle 2\nmiddle 3\nmiddle 4\nLAST-A\n'),
+        () => write('f.txt', 'FIRST-B\nmiddle 1\nmiddle 2\nmiddle 3\nmiddle 4\nLAST-B\n'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(spansOf(finding!, branchA)).toMatchObject([
+        { startLine: 1, endLine: 1, excerpt: 'FIRST-A' },
+        { startLine: 6, endLine: 6, excerpt: 'LAST-A' },
+      ]);
+      expect(spansOf(finding!, branchB)).toMatchObject([
+        { startLine: 1, endLine: 1, excerpt: 'FIRST-B' },
+        { startLine: 6, endLine: 6, excerpt: 'LAST-B' },
+      ]);
+    });
+
+    it('handle a last line with no newline after it', async () => {
+      const request = await pair(
+        () => write('f.txt', 'a\nb\nc'),
+        () => write('f.txt', 'a\nb\nC-A'),
+        () => write('f.txt', 'a\nb\nC-B'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(spansOf(finding!, branchA)).toMatchObject([
+        { startLine: 3, endLine: 3, excerpt: 'C-A' },
+      ]);
+      expect(spansOf(finding!, branchB)).toMatchObject([
+        { startLine: 3, endLine: 3, excerpt: 'C-B' },
+      ]);
+    });
+
+    it('keep CRLF lines exact, carriage returns included', async () => {
+      const request = await pair(
+        () => write('f.txt', 'one\r\ntwo\r\nthree\r\n'),
+        () => write('f.txt', 'one\r\nTWO-A\r\nthree\r\n'),
+        () => write('f.txt', 'one\r\nTWO-B\r\nthree\r\n'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('overlapping-edit');
+      expect(spansOf(finding!, branchA)).toMatchObject([
+        { startLine: 2, endLine: 2, excerpt: 'TWO-A\r' },
+      ]);
+      expect(spansOf(finding!, branchB)).toMatchObject([
+        { startLine: 2, endLine: 2, excerpt: 'TWO-B\r' },
+      ]);
+    });
+
+    it('name a path holding a newline as it is', async () => {
+      const path = 'odd\nname.txt';
+      const request = await pair(
+        () => write(path, 'x\n'),
+        () => write(path, 'A\n'),
+        () => write(path, 'B\n'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(provenanceOf(finding!).path).toBe(path);
+      expect(spansOf(finding!, branchA)).toMatchObject([{ path, startLine: 1, endLine: 1 }]);
+      expect(spansOf(finding!, branchB)).toMatchObject([{ path, startLine: 1, endLine: 1 }]);
+      // Repository content stays in evidence, where the agent boundary wraps it.
+      expect(finding!.title).not.toContain('name.txt');
+      expect(finding!.description).not.toContain('name.txt');
+    });
+
+    it('are bounded excerpts, never the whole region', async () => {
+      const many = (tag: string): string =>
+        Array.from({ length: 40 }, (_, i) => `${tag} ${i}`).join('\n');
+      const request = await pair(
+        () => write('f.txt', 'start\nx\nend\n'),
+        () => write('f.txt', `start\n${many('a')}\nend\n`),
+        () => write('f.txt', `start\n${many('b')}\nend\n`),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+      const [a] = spansOf(finding!, branchA);
+
+      expect(a).toMatchObject({ startLine: 2, endLine: 41 });
+      expect(a!.excerpt.split('\n')).toHaveLength(MAX_EXCERPT_LINES);
+    });
+
+    it('stay with their own region when a side has none for an earlier one', async () => {
+      const spaced = (tag: (i: number) => string): string =>
+        [0, 1].map((i) => `${tag(i)}\n1\n2\n3\n4\n5\n`).join('');
+      const request = await pair(
+        () =>
+          write(
+            'f.txt',
+            spaced((i) => `x${i}`),
+          ),
+        () => {
+          write(
+            'f.txt',
+            spaced((i) => `a${i}`),
+          );
+          // The same file with the first region's line gone: side A as a
+          // merge driver or a filter could leave it, placeable only at the second.
+          write(
+            'g.txt',
+            spaced((i) => (i === 0 ? 'elsewhere' : `a${i}`)),
+          );
+        },
+        () =>
+          write(
+            'f.txt',
+            spaced((i) => `b${i}`),
+          ),
+      );
+      const ctx = await context(request);
+      const moved = git('rev-parse', `${request.commitA}:g.txt`).trim();
+      const stages = ctx.merged.stages.map((s) => (s.stage === 2 ? { ...s, oid: moved } : s));
+
+      const outcome = await textualAnalyzer.analyze({
+        ...ctx,
+        merged: { ...ctx.merged, stages },
+      });
+      const [finding] = outcome.findings;
+      const spans = finding!.evidence.flatMap((e) =>
+        e.type === 'span' ? [[e.branchRefId === branchA ? 'A' : 'B', e.startLine]] : [],
+      );
+
+      expect(spans).toEqual([
+        ['B', 1],
+        ['A', 7],
+        ['B', 7],
+      ]);
+      expect(finding!.description).toContain(' 1 region lacks a span on one side or both.');
+    });
+  });
+
+  describe('excerpts', () => {
+    const key = [
+      '-----BEGIN RSA PRIVATE KEY-----',
+      ...Array.from({ length: MAX_EXCERPT_LINES + 5 }, (_, i) => `MIIBOgIBAAJBAK${i}`),
+      '-----END RSA PRIVATE KEY-----',
+    ];
+
+    it('redact a key whose end falls past the line bound', () => {
+      const excerpt = excerptOf(['const pem = `', ...key, '`;']);
+
+      expect(excerpt).toBe(`const pem = \`\n${REDACTED}\n\`;`);
+    });
+
+    it('drop everything from a key the span holds only the start of', () => {
+      const excerpt = excerptOf(['before', ...key.slice(0, 3)]);
+
+      expect(excerpt).toBe(`before\n${REDACTED}`);
+    });
+
+    it('redact a token that straddles the character bound', () => {
+      const token = `ghp_${'A'.repeat(36)}`;
+      const excerpt = excerptOf([`${'x'.repeat(MAX_EXCERPT_CHARS - 20)} ${token}`]);
+
+      expect(excerpt).not.toContain('ghp_');
+      expect(excerpt).not.toContain('AAAA');
+      expect(excerpt).toContain(REDACTED);
+    });
+  });
+
+  describe('a binary conflict', () => {
+    it('is a whole-file edit with no span, since there are no lines to place', async () => {
+      const request = await pair(
+        () => write('img.bin', Buffer.from([0, 1, 2, 3])),
+        () => write('img.bin', Buffer.from([0, 1, 2, 4])),
+        () => write('img.bin', Buffer.from([0, 1, 2, 5])),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('whole-file-edit');
+      expect(finding!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+      expect(provenanceOf(finding!).conflictTypes).toEqual(
+        expect.arrayContaining(['CONFLICT (binary)', 'CONFLICT (contents)']),
+      );
+    });
+
+    it('added on both sides is an add/add with no span', async () => {
+      const request = await pair(
+        () => write('README', 'r\n'),
+        () => write('img.bin', Buffer.from([0, 1, 2, 4])),
+        () => write('img.bin', Buffer.from([0, 1, 2, 5])),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('add-add');
+      expect(finding!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+    });
+  });
+
+  describe('many conflicted files', () => {
+    it(`raise at most ${MAX_FINDINGS_PER_RUN} Findings, the most severe first`, async () => {
+      const files = Array.from({ length: 60 }, (_, i) => `f${String(i).padStart(2, '0')}.txt`);
+      const request = await pair(
+        () => {
+          for (const file of files) write(file, 'a\nb\nc\n');
+          write('zz-gone.txt', 'a\nb\nc\n');
+        },
+        () => {
+          // Adjacent on every file, so each is low; the modify/delete is high.
+          for (const file of files) write(file, 'A\nb\nc\n');
+          write('zz-gone.txt', 'a\nB\nc\n');
+        },
+        () => {
+          for (const file of files) write(file, 'a\nB\nc\n');
+          git('rm', '-q', 'zz-gone.txt');
+        },
+      );
+
+      const records: LogRecord[] = [];
+      const logger = createLogger('test', { level: 'debug', sink: (r) => records.push(r) });
+      const outcome = await textualAnalyzer.analyze({ ...(await context(request)), logger });
+
+      expect(outcome.findings).toHaveLength(MAX_FINDINGS_PER_RUN);
+      expect(outcome.findings[0]!.rule).toBe('delete-vs-modify');
+      expect(outcome.findings.slice(1).every((f) => f.rule === 'adjacent-addition')).toBe(true);
+      expect(records).toContainEqual(
+        expect.objectContaining({
+          level: 'warn',
+          dropped: 61 - MAX_FINDINGS_PER_RUN,
+          bound: MAX_FINDINGS_PER_RUN,
+        }),
+      );
+    });
+
+    it('report how many paths went unexamined', async () => {
+      const request = await pair(
+        () => write('README', 'r\n'),
+        () => write('f.txt', 'a\n'),
+        () => write('f.txt', 'b\n'),
+      );
+
+      const classified = await classifyTextualConflicts(
+        {
+          runId: ulid<SpeculativeRunId>(),
+          branchA,
+          branchB,
+          merge: request,
+          merged: await speculativeMerge(request, { runner }),
+          now: '2026-01-01T00:00:00.000Z',
+        },
+        { runner },
+      );
+
+      expect(classified.dropped).toBe(0);
+      expect(classified.findings[0]).toMatchObject({
+        firstSeenAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      });
+    });
+  });
+
+  describe('conflicts no class covers', () => {
+    /** One Finding, with git's tokens and no span: a conflict, never a clean merge. */
+    const expectOther = (outcome: AnalyzerOutcome, token: string): Finding => {
+      expect(outcome.verdict).toBe('findings');
+      expect(outcome.findings).toHaveLength(1);
+      const finding = outcome.findings[0]!;
+      expect(finding).toMatchObject({ rule: 'other-conflict', severity: 'medium', confidence: 1 });
+      expect(provenanceOf(finding).conflictTypes).toContain(token);
+      expect(finding.evidence.filter((e) => e.type === 'span')).toEqual([]);
+      return finding;
+    };
+
+    it('report a rename on both sides as one Finding naming each side’s path', async () => {
+      const request = await pair(
+        () => write('x.txt', 'one\ntwo\nthree\nfour\n'),
+        () => git('mv', 'x.txt', 'y.txt'),
+        () => git('mv', 'x.txt', 'z.txt'),
+      );
+
+      const finding = expectOther(await analyze(request), 'CONFLICT (rename/rename)');
+
+      expect(provenanceOf(finding)).toMatchObject({
+        path: 'x.txt',
+        base: { path: 'x.txt' },
+        sideA: { path: 'y.txt' },
+        sideB: { path: 'z.txt' },
+      });
+    });
+
+    it('give no span even where a side’s lines changed', async () => {
+      const request = await pair(
+        () => write('x.txt', 'one\ntwo\nthree\nfour\nfive\n'),
+        () => {
+          git('mv', 'x.txt', 'y.txt');
+          write('y.txt', 'one\ntwo\nTHREE\nfour\nfive\n');
+        },
+        () => git('mv', 'x.txt', 'z.txt'),
+      );
+
+      expectOther(await analyze(request), 'CONFLICT (rename/rename)');
+    });
+
+    it('report a file against a directory', async () => {
+      const request = await pair(
+        () => write('README', 'r\n'),
+        () => write('d/f.txt', 'in a directory\n'),
+        () => write('d', 'a file\n'),
+      );
+
+      expectOther(await analyze(request), 'CONFLICT (file/directory)');
+    });
+
+    it('report a file against a symlink', async () => {
+      const request = await pair(
+        () => write('t', 'text\n'),
+        () => {
+          unlinkSync(join(dir, 't'));
+          symlinkSync('target', join(dir, 't'));
+        },
+        () => write('t', 'edited\n'),
+      );
+
+      const finding = expectOther(await analyze(request), 'CONFLICT (distinct modes)');
+      // Filed under the path, not the `t~<commit>` name git moved one side to,
+      // which changes with every commit — and the base, recorded under the moved
+      // name, found all the same.
+      expect(provenanceOf(finding)).toMatchObject({
+        path: 't',
+        base: { path: 't' },
+        sideA: { path: 't', mode: '120000' },
+        sideB: { path: 't' },
+      });
+    });
+
+    it('keep a real file whose name looks moved aside under its own path', async () => {
+      const request = await pair(
+        () => {
+          write('a', 'x\n');
+          write('a~b', 'x\n');
+        },
+        () => {
+          write('a', 'A\n');
+          write('a~b', 'A\n');
+        },
+        () => {
+          write('a', 'B\n');
+          write('a~b', 'B\n');
+        },
+      );
+
+      const { findings } = await analyze(request);
+
+      expect(findings.map((f) => provenanceOf(f).path).sort()).toEqual(['a', 'a~b']);
+    });
+
+    it('keep a renamed file under its new name when the old one is a prefix of it', async () => {
+      const request = await pair(
+        () => write('util', 'one\ntwo\nthree\nfour\n'),
+        () => git('mv', 'util', 'util2'),
+        () => git('rm', '-q', 'util'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('rename-vs-delete');
+      expect(provenanceOf(finding!).path).toBe('util2');
+    });
+
+    it('file a moved-aside file under the path it came from, whatever its class', async () => {
+      const request = await pair(
+        () => write('d', 'a file\n'),
+        () => {
+          git('rm', '-q', 'd');
+          write('d/f.txt', 'now a directory\n');
+        },
+        () => write('d', 'an edited file\n'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('delete-vs-modify');
+      expect(provenanceOf(finding!).path).toBe('d');
+      expect(provenanceOf(finding!).sideB?.path).toBe('d');
+    });
+  });
+
+  describe('a symlink changed two ways', () => {
+    it('is a whole-file edit with no span, since a target is not lines', async () => {
+      const request = await pair(
+        () => symlinkSync('target-0', join(dir, 'link')),
+        () => {
+          unlinkSync(join(dir, 'link'));
+          symlinkSync('target-a', join(dir, 'link'));
+        },
+        () => {
+          unlinkSync(join(dir, 'link'));
+          symlinkSync('target-b', join(dir, 'link'));
+        },
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('whole-file-edit');
+      expect(provenanceOf(finding!).sideA).toMatchObject({ path: 'link', mode: '120000' });
+      expect(finding!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+    });
+  });
+
+  describe('a side whose blob is at more than one path', () => {
+    it('gets no path and no span rather than a guess', async () => {
+      // B writes the same content to two files, so its half of the renamed
+      // conflict could be either.
+      const body = 'fn one\nfn two\nfn three\nfn four\nfn five\nfn six\n';
+      const request = await pair(
+        () => {
+          write('parser.ts', body);
+          write('copy.ts', body);
+        },
+        () => {
+          git('mv', 'parser.ts', 'parse.ts');
+          write('parse.ts', body.replace('fn two', 'fn TWO-A'));
+        },
+        () => {
+          write('parser.ts', body.replace('fn two', 'fn TWO-B'));
+          write('copy.ts', body.replace('fn two', 'fn TWO-B'));
+        },
+      );
+
+      const [finding] = (await analyze(request)).findings;
+      const provenance = provenanceOf(finding!);
+
+      expect(provenance.path).toBe('parse.ts');
+      expect(provenance.sideA?.path).toBe('parse.ts');
+      expect(provenance.sideB?.path).toBeNull();
+      expect(spansOf(finding!, branchA)).toMatchObject([{ path: 'parse.ts', startLine: 2 }]);
+      expect(spansOf(finding!, branchB)).toEqual([]);
+    });
+  });
+
+  describe('stage sets git does not produce', () => {
+    /**
+     * Each starts from a real merge and changes one thing about its stages, so
+     * it passes every check but the one it is aimed at.
+     */
+    const cases: readonly {
+      name: string;
+      setup: () => void;
+      one: () => void;
+      two: () => void;
+      bend: (stages: readonly ConflictStage[]) => ConflictStage[];
+      mute?: boolean;
+    }[] = [
+      {
+        name: 'a modify/delete with no base',
+        setup: () => write('f.txt', 'a\n'),
+        one: () => write('f.txt', 'A\n'),
+        two: () => git('rm', '-q', 'f.txt'),
+        bend: (stages) => stages.filter((s) => s.stage !== 1),
+      },
+      {
+        name: 'a modify/delete with both sides',
+        setup: () => write('f.txt', 'a\n'),
+        one: () => write('f.txt', 'A\n'),
+        two: () => git('rm', '-q', 'f.txt'),
+        bend: (stages) => [...stages, { ...stages.find((s) => s.stage === 2)!, stage: 3 }],
+      },
+      {
+        name: 'a rename/delete with no base',
+        setup: () => write('f.txt', 'one\ntwo\nthree\nfour\n'),
+        one: () => git('mv', 'f.txt', 'g.txt'),
+        two: () => git('rm', '-q', 'f.txt'),
+        bend: (stages) => stages.filter((s) => s.stage !== 1),
+      },
+      {
+        name: 'a rename/delete with both sides',
+        setup: () => write('f.txt', 'one\ntwo\nthree\nfour\n'),
+        one: () => git('mv', 'f.txt', 'g.txt'),
+        two: () => git('rm', '-q', 'f.txt'),
+        bend: (stages) => [...stages, { ...stages.find((s) => s.stage === 2)!, stage: 3 }],
+      },
+      {
+        name: 'a conflicted path no message names',
+        setup: () => write('f.txt', 'a\n'),
+        one: () => write('f.txt', 'A\n'),
+        two: () => write('f.txt', 'B\n'),
+        bend: (stages) => [...stages],
+        mute: true,
+      },
+      {
+        name: 'a content conflict missing a side',
+        setup: () => write('f.txt', 'a\n'),
+        one: () => write('f.txt', 'A\n'),
+        two: () => write('f.txt', 'B\n'),
+        bend: (stages) => stages.filter((s) => s.stage !== 3),
+      },
+    ];
+
+    it.each(cases)(
+      'report $name as a conflict no class covers',
+      async ({ setup, one, two, bend, mute }) => {
+        const request = await pair(setup, one, two);
+        const ctx = await context(request);
+        const real = await textualAnalyzer.analyze(ctx);
+        expect(real.findings[0]!.rule).not.toBe('other-conflict');
+
+        const messages = mute ? [] : ctx.merged.messages;
+        const bent = {
+          ...ctx,
+          merged: { ...ctx.merged, stages: bend(ctx.merged.stages), messages },
+        };
+        const outcome = await textualAnalyzer.analyze(bent);
+
+        expect(outcome.verdict).toBe('findings');
+        expect(outcome.findings.map((f) => f.rule)).toEqual(['other-conflict']);
+      },
+    );
+  });
+
+  describe('one side that is not a regular file', () => {
+    it.each([2, 3] as const)(
+      'leaves a content conflict unplaced when stage %i is not',
+      async (stage) => {
+        const request = await pair(
+          () => write('f.txt', 'a\n'),
+          () => write('f.txt', 'A\n'),
+          () => write('f.txt', 'B\n'),
+        );
+        const ctx = await context(request);
+        const stages = ctx.merged.stages.map((s) =>
+          s.stage === stage ? { ...s, mode: '120000' } : s,
+        );
+
+        const outcome = await textualAnalyzer.analyze({
+          ...ctx,
+          merged: { ...ctx.merged, stages },
+        });
+
+        expect(outcome.findings[0]!.rule).toBe('whole-file-edit');
+        expect(outcome.findings[0]!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+      },
+    );
+  });
+
+  describe('a deleted file with no lines to read', () => {
+    it('gives no span when the file is binary', async () => {
+      const request = await pair(
+        () => write('img.bin', Buffer.from([0, 1, 2, 3, 10, 4])),
+        () => write('img.bin', Buffer.from([0, 1, 2, 9, 10, 4])),
+        () => git('rm', '-q', 'img.bin'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('delete-vs-modify');
+      expect(finding!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+    });
+
+    it('gives no span when only the base was binary', async () => {
+      const request = await pair(
+        () => write('f.dat', Buffer.from([0, 1, 10, 2])),
+        () => write('f.dat', 'now text\n'),
+        () => git('rm', '-q', 'f.dat'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('delete-vs-modify');
+      expect(finding!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+    });
+
+    it('gives no span when the file is a symlink', async () => {
+      const request = await pair(
+        () => symlinkSync('target-0', join(dir, 'link')),
+        () => {
+          unlinkSync(join(dir, 'link'));
+          symlinkSync('target-a', join(dir, 'link'));
+        },
+        () => git('rm', '-q', 'link'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('delete-vs-modify');
+      expect(provenanceOf(finding!).sideA).toMatchObject({ mode: '120000' });
+      expect(finding!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+    });
+  });
+
+  describe('a deleted file whose type changed on the other side', () => {
+    it('gives no span when a file became a symlink', async () => {
+      const request = await pair(
+        () => write('f', 'line\n'),
+        () => {
+          unlinkSync(join(dir, 'f'));
+          symlinkSync('target', join(dir, 'f'));
+        },
+        () => git('rm', '-q', 'f'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('delete-vs-modify');
+      expect(provenanceOf(finding!).sideA).toMatchObject({ mode: '120000' });
+      expect(finding!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+    });
+
+    it('gives no span when a symlink became a file', async () => {
+      const request = await pair(
+        () => symlinkSync('target', join(dir, 'f')),
+        () => {
+          unlinkSync(join(dir, 'f'));
+          write('f', 'target\nmore\n');
+        },
+        () => git('rm', '-q', 'f'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('delete-vs-modify');
+      expect(provenanceOf(finding!).base).toMatchObject({ mode: '120000' });
+      expect(finding!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+    });
+
+    it('gives no span when text was rewritten as binary', async () => {
+      const request = await pair(
+        () => write('f.dat', 'text\n'),
+        () => write('f.dat', Buffer.from([0, 1, 10, 2])),
+        () => git('rm', '-q', 'f.dat'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('delete-vs-modify');
+      expect(finding!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+    });
+  });
+
+  describe('ordering', () => {
+    it('examines a text conflict that may be high ahead of add/adds at the bound', async () => {
+      const added = Array.from({ length: MAX_FINDINGS_PER_RUN }, (_, i) => `new${i}.txt`);
+      const request = await pair(
+        () => write('zz.txt', 'a\n'),
+        () => {
+          for (const file of added) write(file, 'one\n');
+          write('zz.txt', 'A\n');
+        },
+        () => {
+          for (const file of added) write(file, 'two\n');
+          write('zz.txt', 'B\n');
+        },
+      );
+
+      const { findings } = await analyze(request);
+
+      expect(findings).toHaveLength(MAX_FINDINGS_PER_RUN);
+      expect(findings[0]!.rule).toBe('overlapping-edit');
+    });
+
+    it('reports by final severity, not by the order paths were examined in', async () => {
+      const request = await pair(
+        () => write('a.txt', 'x\ny\n'),
+        () => {
+          write('a.txt', 'X\ny\n');
+          write('b.txt', 'one\n');
+        },
+        () => {
+          write('a.txt', 'x\nY\n');
+          write('b.txt', 'two\n');
+        },
+      );
+
+      const { findings } = await analyze(request);
+
+      expect(findings.map((f) => f.rule)).toEqual(['add-add', 'adjacent-addition']);
+    });
+  });
+
+  describe('a blob at its recorded path that is also copied elsewhere', () => {
+    it('is taken at the recorded path', async () => {
+      const request = await pair(
+        () => {
+          write('f.txt', 'a\n');
+          write('g.txt', 'a\n');
+        },
+        () => {
+          write('f.txt', 'A\n');
+          write('g.txt', 'A\n');
+        },
+        () => {
+          write('f.txt', 'B\n');
+          write('g.txt', 'B\n');
+        },
+      );
+
+      const { findings } = await analyze(request);
+
+      expect(findings).toHaveLength(2);
+      for (const finding of findings) {
+        const path = provenanceOf(finding).path;
+        expect(spansOf(finding, branchA)).toMatchObject([{ path, startLine: 1 }]);
+        expect(spansOf(finding, branchB)).toMatchObject([{ path, startLine: 1 }]);
+      }
+    });
+  });
+
+  describe('spans past the bound', () => {
+    /** `count` changed lines, each with five untouched lines around it. */
+    const spaced = (count: number, tag: (i: number) => string): string =>
+      Array.from({ length: count }, (_, i) => `${tag(i)}\n1\n2\n3\n4\n5\n`).join('');
+
+    it('are counted in the description, for regions', async () => {
+      const request = await pair(
+        () =>
+          write(
+            'f.txt',
+            spaced(MAX_SPANS_PER_SIDE + 1, (i) => `x${i}`),
+          ),
+        () =>
+          write(
+            'f.txt',
+            spaced(MAX_SPANS_PER_SIDE + 1, (i) => `a${i}`),
+          ),
+        () =>
+          write(
+            'f.txt',
+            spaced(MAX_SPANS_PER_SIDE + 1, (i) => `b${i}`),
+          ),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(spansOf(finding!, branchA)).toHaveLength(MAX_SPANS_PER_SIDE);
+      expect(spansOf(finding!, branchB)).toHaveLength(MAX_SPANS_PER_SIDE);
+      expect(finding!.description).toContain(' 1 region lacks a span on one side or both.');
+    });
+
+    it('are counted in the description, for a deleted file’s changes', async () => {
+      const request = await pair(
+        () =>
+          write(
+            'f.txt',
+            spaced(MAX_SPANS_PER_SIDE + 2, (i) => `x${i}`),
+          ),
+        () =>
+          write(
+            'f.txt',
+            spaced(MAX_SPANS_PER_SIDE + 2, (i) => `a${i}`),
+          ),
+        () => git('rm', '-q', 'f.txt'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('delete-vs-modify');
+      expect(spansOf(finding!, branchA)).toHaveLength(MAX_SPANS_PER_SIDE);
+      expect(finding!.description).toContain(' 2 regions lack a span on one side or both.');
+    });
+
+    it('are all given when there are no more than the bound', async () => {
+      const request = await pair(
+        () =>
+          write(
+            'f.txt',
+            spaced(2, (i) => `x${i}`),
+          ),
+        () =>
+          write(
+            'f.txt',
+            spaced(2, (i) => `a${i}`),
+          ),
+        () =>
+          write(
+            'f.txt',
+            spaced(2, (i) => `b${i}`),
+          ),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(spansOf(finding!, branchA)).toHaveLength(2);
+      expect(finding!.description).not.toContain('lack');
+    });
+  });
+
+  describe('a file past the size bound', () => {
+    const big = (tag: string): string =>
+      `${tag}\n${'x'.repeat(80)}\n`.repeat(Math.ceil(MAX_BLOB_BYTES / 80));
+
+    it('is not read, so a content conflict in it says the weaker thing, without spans', async () => {
+      const request = await pair(
+        () => write('lock.json', big('base')),
+        () => write('lock.json', `ours\n${big('base')}`),
+        () => write('lock.json', `theirs\n${big('base')}`),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('adjacent-addition');
+      expect(finding!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+    });
+
+    it('is not read for a deleted file’s changes, on either version', async () => {
+      const survivorBig = await pair(
+        () => write('f.txt', 'small\n'),
+        () => write('f.txt', big('grown')),
+        () => git('rm', '-q', 'f.txt'),
+      );
+      const [grown] = (await analyze(survivorBig)).findings;
+      expect(grown!.rule).toBe('delete-vs-modify');
+      expect(grown!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+    });
+
+    it('is not read when only the base was large', async () => {
+      const request = await pair(
+        () => write('f.txt', big('base')),
+        () => write('f.txt', 'shrunk\n'),
+        () => git('rm', '-q', 'f.txt'),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('delete-vs-modify');
+      expect(finding!.evidence.filter((e) => e.type === 'span')).toEqual([]);
+    });
+
+    /** The rename/edit fixture, whose unrenamed side is sized by `cat-file -s`. */
+    const renamed = (): Promise<SpeculativeMergeRequest> => {
+      const fixture = TEXTUAL_FIXTURES.find((f) => f.name.startsWith('rename/edit —'))!;
+      return pair(
+        () => {
+          for (const [path, content] of Object.entries(fixture.base)) write(path, content);
+        },
+        () => apply(fixture.one),
+        () => apply(fixture.two),
+      );
+    };
+    const sizing = (answer: string): GitRunner => ({
+      run: (target, args, options) =>
+        args[0] === 'cat-file' && args[1] === '-s'
+          ? Promise.resolve({ stdout: `${answer}\n`, stderr: '', exitCode: 0 })
+          : runner.run(target, args, options),
+    });
+
+    it('is asked of git for a side no listing sized, and that side goes unplaced', async () => {
+      const request = await renamed();
+
+      const outcome = await textualAnalyzer.analyze(
+        await context(request, sizing(String(MAX_BLOB_BYTES + 1))),
+      );
+
+      const finding = outcome.findings[0]!;
+      expect(finding.rule).toBe('overlapping-edit');
+      expect(spansOf(finding, branchA)).toHaveLength(1);
+      expect(spansOf(finding, branchB)).toEqual([]);
+    });
+
+    it('is an infra-failure when git answers a size that is not one', async () => {
+      const request = await renamed();
+
+      const outcome = await textualAnalyzer.analyze(await context(request, sizing('lots')));
+
+      expect(outcome.verdict).toBe('infra-failure');
+      expect(outcome.diagnostic).toMatch(/^MERGE_FAILED: /u);
+    });
+  });
+
+  describe('a region too large to align against its base', () => {
+    it('says the weaker thing, and still places both sides', async () => {
+      const block = (tag: string): string =>
+        Array.from({ length: 1001 }, (_, i) => `${tag} ${i}`).join('\n');
+      const request = await pair(
+        () => write('f.txt', 'start\nx\nend\n'),
+        () => write('f.txt', `start\n${block('a')}\nend\n`),
+        () => write('f.txt', `start\n${block('b')}\nend\n`),
+      );
+
+      const [finding] = (await analyze(request)).findings;
+
+      expect(finding!.rule).toBe('adjacent-addition');
+      expect(finding!.severity).toBe('low');
+      expect(spansOf(finding!, branchA)).toMatchObject([{ startLine: 2, endLine: 1002 }]);
+      expect(spansOf(finding!, branchB)).toMatchObject([{ startLine: 2, endLine: 1002 }]);
+    });
+  });
+
+  describe('identity', () => {
+    const run = async (
+      request: SpeculativeMergeRequest,
+      a: BranchRefId,
+      b: BranchRefId,
+    ): Promise<Finding> => {
+      const outcome = await textualAnalyzer.analyze({
+        ...(await context(request)),
+        branchA: a,
+        branchB: b,
+      });
+      return outcome.findings[0]!;
+    };
+
+    it('is the same for the same conflict seen again, merged either way round', async () => {
+      const first = await pair(
+        () => write('f.txt', 'a\nb\nc\nd\ne\nf\n'),
+        () => write('f.txt', 'a\nb\nc\nd\ne\nF-A\n'),
+        () => write('f.txt', 'a\nb\nc\nd\ne\nF-B\n'),
+      );
+      const seen = await run(first, branchA, branchB);
+
+      // Branch A moves on above the conflict: the span moves, the finding does not.
+      git('checkout', '-q', 'one');
+      write('f.txt', 'new top\na\nb\nc\nd\ne\nF-A\n');
+      const moved = commit('one again');
+      const again = await run({ ...first, commitA: moved }, branchA, branchB);
+      const swapped = await run(
+        { ...first, commitA: first.commitB, commitB: moved },
+        branchB,
+        branchA,
+      );
+
+      expect(spansOf(again, branchA)[0]!.startLine).not.toBe(spansOf(seen, branchA)[0]!.startLine);
+      expect(textualFindingKey(again)).toBe(textualFindingKey(seen));
+      expect(textualFindingKey(swapped)).toBe(textualFindingKey(seen));
+      expect(again.id).not.toBe(seen.id);
+    });
+
+    it('differs when the class does', async () => {
+      const request = await pair(
+        () => write('f.txt', 'a\nb\nc\n'),
+        () => write('f.txt', 'A\nb\nc\n'),
+        () => write('f.txt', 'a\nB\nc\n'),
+      );
+      const adjacent = await run(request, branchA, branchB);
+
+      git('checkout', '-q', 'two');
+      write('f.txt', 'A2\nB\nc\n');
+      const overlapping = await run({ ...request, commitB: commit('two again') }, branchA, branchB);
+
+      expect([adjacent.rule, overlapping.rule]).toEqual(['adjacent-addition', 'overlapping-edit']);
+      expect(textualFindingKey(overlapping)).not.toBe(textualFindingKey(adjacent));
+    });
+
+    it('is null for a Finding that is not textual, or carries no merge', async () => {
+      const request = await pair(
+        () => write('f.txt', 'a\n'),
+        () => write('f.txt', 'A\n'),
+        () => write('f.txt', 'B\n'),
+      );
+      const finding = await run(request, branchA, branchB);
+
+      expect(textualFindingKey(finding)).not.toBeNull();
+      expect(textualFindingKey({ ...finding, kind: 'typecheck' })).toBeNull();
+      expect(
+        textualFindingKey({
+          ...finding,
+          evidence: finding.evidence.filter((e) => e.type === 'span'),
+        }),
+      ).toBeNull();
+    });
+  });
+
+  describe('when the shadow cannot be read', () => {
+    it('is an infra-failure with a diagnostic naming no path, never an empty list', async () => {
+      const request = await pair(
+        () => write('secret-name.txt', 'a\n'),
+        () => write('secret-name.txt', 'A\n'),
+        () => write('secret-name.txt', 'B\n'),
+      );
+      const failing: GitRunner = {
+        run: (target, args, options) =>
+          args[0] === 'cat-file'
+            ? Promise.resolve({ stdout: '', stderr: 'fatal: secret-name.txt', exitCode: 128 })
+            : runner.run(target, args, options),
+      };
+
+      const outcome = await textualAnalyzer.analyze(await context(request, failing));
+
+      expect(outcome.verdict).toBe('infra-failure');
+      expect(outcome.findings).toEqual([]);
+      expect(outcome.diagnostic).toMatch(/^GIT_COMMAND_FAILED: /u);
+      expect(outcome.diagnostic).not.toContain('secret-name');
+    });
+
+    it('lets an error that is not the runner’s through, since that is a bug', async () => {
+      const request = await pair(
+        () => write('f.txt', 'a\n'),
+        () => write('f.txt', 'A\n'),
+        () => write('f.txt', 'B\n'),
+      );
+      const broken: GitRunner = {
+        run: (target, args, options) =>
+          args[0] === 'cat-file'
+            ? Promise.reject(new TypeError('boom'))
+            : runner.run(target, args, options),
+      };
+
+      await expect(textualAnalyzer.analyze(await context(request, broken))).rejects.toThrow('boom');
+    });
+
+    it('lets a command the runner refused through, since only our own code builds one', async () => {
+      const request = await pair(
+        () => write('f.txt', 'a\n'),
+        () => write('f.txt', 'A\n'),
+        () => write('f.txt', 'B\n'),
+      );
+      const refusing: GitRunner = {
+        run: (target, args, options) =>
+          args[0] === 'cat-file'
+            ? Promise.reject(new InterlockError('GIT_COMMAND_REFUSED', 'refused'))
+            : runner.run(target, args, options),
+      };
+
+      const error = await rejection(textualAnalyzer.analyze(await context(request, refusing)));
+
+      expect(error.code).toBe('GIT_COMMAND_REFUSED');
+    });
+  });
+});

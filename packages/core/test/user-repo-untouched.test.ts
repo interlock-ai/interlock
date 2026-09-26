@@ -12,9 +12,10 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isInterlockError, makePairKey, ulid } from '@interlock/shared';
-import type { BranchRefId, SnapshotId } from '@interlock/shared';
+import type { BranchRefId, SnapshotId, SpeculativeRunId } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  classifyTextualConflicts,
   captureDirtyState,
   commitSnapshotInShadow,
   createGitRunner,
@@ -91,7 +92,7 @@ describe('user repositories are never modified', () => {
    */
   const cycle = async (
     root: string,
-  ): Promise<{ diffed: number; excused: number; pooled: number }> => {
+  ): Promise<{ diffed: number; excused: number; findings: number; pooled: number }> => {
     const handle: UserRepo = await openUserRepo(root, { runner });
     const repo = await describeRepo(handle, { runner, dataDir });
     // Reads the user repository over git's own local transport, which is the
@@ -104,6 +105,7 @@ describe('user repositories are never modified', () => {
     const pool = createWorktreePool(shadow, { runner, dataDir, repoId: repo.id, size: 1 });
     let diffed = 0;
     let excused = 0;
+    let findings = 0;
     let pooled = 0;
 
     for (const branch of branches) {
@@ -170,13 +172,31 @@ describe('user repositories are never modified', () => {
       ]);
       const commitA = snapshotCommit ?? branch.headSha;
       const commitB = target.stdout.trim();
-      const merged = await speculativeMerge({ shadow, commitA, commitB, mergeBaseSha }, { runner });
+      const request = { shadow, commitA, commitB, mergeBaseSha };
+      const merged = await speculativeMerge(request, { runner });
+
+      // A conflict is classified by reading each side's blob, which in the
+      // shadow means reading through alternates into the user's store.
+      if (!merged.clean) {
+        const classified = await classifyTextualConflicts(
+          {
+            runId: ulid<SpeculativeRunId>(),
+            branchA: ulid<BranchRefId>(),
+            branchB: ulid<BranchRefId>(),
+            merge: request,
+            merged,
+            now: new Date().toISOString(),
+          },
+          { runner },
+        );
+        findings += classified.findings.length;
+      }
 
       // A clean pair reaches a pool slot: filled, then updated by delta. The
       // reset that does it is the one mutating command in the whole cycle, and
       // it runs in the shadow's worktree, never this repository's.
       if (merged.clean) {
-        const request = {
+        const slotRequest = {
           key: makePairKey(branch.id, ulid<BranchRefId>()),
           commitA,
           commitB,
@@ -184,7 +204,7 @@ describe('user repositories are never modified', () => {
           dependencyTreeOid: merged.treeOid,
         };
         for (const expected of ['cold', 'delta']) {
-          const outcome = await pool.withSlot(request, () => Promise.resolve());
+          const outcome = await pool.withSlot(slotRequest, () => Promise.resolve());
           expect(outcome.kind === 'ran' && outcome.fill).toBe(expected);
         }
         pooled += 1;
@@ -193,11 +213,11 @@ describe('user repositories are never modified', () => {
       diffed += 1;
     }
 
-    return { diffed, excused, pooled };
+    return { diffed, excused, findings, pooled };
   };
 
   /** Capture, run, capture, and fail with the diagnosis rather than a boolean. */
-  const assertUntouched = async (roots: readonly string[]): Promise<void> => {
+  const assertUntouched = async (roots: readonly string[]): Promise<{ findings: number }> => {
     const before = new Map<string, RepoState>(roots.map((root) => [root, captureState(root)]));
     const outcome = await cycle(roots[0]!);
     // Every fixture here has a default branch that resolves, so a cycle that
@@ -210,6 +230,7 @@ describe('user repositories are never modified', () => {
       const diff = diffState(before.get(root)!, after);
       expect(isClean(diff), `${root}\n${describeDiff(diff, before.get(root)!, after)}`).toBe(true);
     }
+    return { findings: outcome.findings };
   };
 
   beforeEach(() => {
@@ -417,6 +438,21 @@ describe('user repositories are never modified', () => {
     await assertUntouched([root]);
   });
 
+  it('leaves the repository unchanged while classifying a conflict', async () => {
+    const root = join(base, 'repo');
+    const linked = join(base, 'linked');
+    init(root);
+    commit(root, 'a.txt', 'one\ntwo\nthree\n', 'one');
+    git(root, 'worktree', 'add', '-q', '-b', 'feature', linked);
+    commit(root, 'a.txt', 'one\nTWO on main\nthree\n', 'main edits');
+    // Uncommitted, so the conflict exists only in a snapshot.
+    writeFileSync(join(linked, 'a.txt'), 'one\nTWO on feature\nthree\n');
+
+    const { findings } = await assertUntouched([root, linked]);
+
+    expect(findings).toBeGreaterThan(0);
+  });
+
   it('leaves .git/index, HEAD, refs, config and packed-refs unchanged', async () => {
     const root = join(base, 'repo');
     init(root);
@@ -492,7 +528,7 @@ describe('user repositories are never modified', () => {
     const after = captureState(root);
     const diff = diffState(before, after);
     expect(isClean(diff), describeDiff(diff, before, after)).toBe(true);
-    expect(outcome).toStrictEqual({ diffed: 0, excused: 1, pooled: 0 });
+    expect(outcome).toStrictEqual({ diffed: 0, excused: 1, findings: 0, pooled: 0 });
   });
 
   it('holds no lock files in the user repo after the run', async () => {

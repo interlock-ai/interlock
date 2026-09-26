@@ -7,8 +7,12 @@ import type {
   Logger,
   SpeculativeRunId,
 } from '@interlock/shared';
+import type { GitRunner } from '../git/repo-handle.js';
 import type { PoolSlot } from '../git/worktree-pool.js';
-import type { SpeculativeMergeResult } from '../merge/speculative-merge.js';
+import type {
+  SpeculativeMergeRequest,
+  SpeculativeMergeResult,
+} from '../merge/speculative-merge.js';
 
 /**
  * The analyzer contract.
@@ -42,6 +46,8 @@ export interface AnalyzerContext {
   readonly branchB: BranchRefId;
   readonly changeSetA: ChangeSet;
   readonly changeSetB: ChangeSet;
+  /** The merge as it was asked for: the shadow, both commits and the merge base. */
+  readonly mergeRequest: SpeculativeMergeRequest;
   readonly merged: SpeculativeMergeResult;
   /**
    * The merged tree on disk, in the pair's pool slot, for an analyzer that
@@ -51,6 +57,8 @@ export interface AnalyzerContext {
    * host.
    */
   readonly slot: PoolSlot | null;
+  /** Reads the shadow; `mergeRequest.shadow` is the only repository it is given. */
+  readonly runner: GitRunner;
   readonly logger: Logger;
   /** Aborted when the run is superseded by newer snapshots. */
   readonly signal: AbortSignal;

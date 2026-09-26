@@ -116,12 +116,16 @@ const EXIT_CONFLICTED = 1;
  */
 const EXIT_USAGE = 129;
 
-const TYPE_CONTENTS = 'CONFLICT (contents)';
+/** git's type token for a content conflict, as the `-z` messages carry it. */
+export const TYPE_CONTENTS = 'CONFLICT (contents)';
 /**
  * Reported alongside `CONFLICT (contents)` for the same file, not instead of it,
  * so `contents` alone does not mean there are markers to read.
  */
-const TYPE_BINARY = 'CONFLICT (binary)';
+export const TYPE_BINARY = 'CONFLICT (binary)';
+
+/** Modes whose blob is text a line can be read from; a symlink holds a target, a gitlink a commit. */
+export const REGULAR_MODES: ReadonlySet<string> = new Set(['100644', '100755']);
 
 /** The length git writes markers at unless a `conflict-marker-size` says otherwise. */
 const MIN_MARKER_LENGTH = 7;
@@ -340,11 +344,10 @@ async function readConflictBlocks(
       ...chunk,
     ]);
     for (const entry of listing.stdout.split('\0')) {
-      // `<mode> SP <type> SP <object> TAB <path>`; a symlink or a submodule
-      // holds a target or a commit, never markers.
+      // `<mode> SP <type> SP <object> TAB <path>`.
       const tab = entry.indexOf('\t');
-      const [mode, type, oid] = entry.slice(0, tab).split(' ');
-      if (tab === -1 || type !== 'blob' || (mode !== '100644' && mode !== '100755')) continue;
+      const [mode = '', type, oid] = entry.slice(0, tab).split(' ');
+      if (tab === -1 || type !== 'blob' || !REGULAR_MODES.has(mode)) continue;
       const blob = await runRequired(runner, shadow, ['cat-file', 'blob', oid!]);
       blocks.push(...parseConflictRegions(entry.slice(tab + 1), blob.stdout));
     }
@@ -366,8 +369,34 @@ async function readConflictBlocks(
  * reading of the file can tell the two apart.
  */
 export function parseConflictRegions(path: string, text: string): ConflictBlock[] {
+  return scanConflictRegions(text).map((region) => ({
+    path,
+    startLine: region.startLine,
+    endLine: region.endLine,
+    ours: region.ours.join('\n'),
+    theirs: region.theirs.join('\n'),
+    base: region.base === null ? null : region.base.join('\n'),
+  }));
+}
+
+/**
+ * A conflict region with each section as its lines.
+ *
+ * Joined, a section of no lines and a section of one empty line are the same
+ * string; anything placing a section in a file needs to tell them apart.
+ */
+export interface ConflictRegionLines {
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly ours: readonly string[];
+  readonly base: readonly string[] | null;
+  readonly theirs: readonly string[];
+}
+
+/** {@link parseConflictRegions}, keeping each section as lines. */
+export function scanConflictRegions(text: string): ConflictRegionLines[] {
   const lines = text.split('\n');
-  const blocks: ConflictBlock[] = [];
+  const regions: ConflictRegionLines[] = [];
 
   for (let at = 0; at < lines.length; at++) {
     const size = markerLength(lines[at]!, '<');
@@ -395,17 +424,10 @@ export function parseConflictRegions(path: string, text: string): ConflictBlock[
     }
 
     if (end === null) break;
-    blocks.push({
-      path,
-      startLine: at + 1,
-      endLine: end + 1,
-      ours: ours.join('\n'),
-      theirs: theirs.join('\n'),
-      base: base === null ? null : base.join('\n'),
-    });
+    regions.push({ startLine: at + 1, endLine: end + 1, ours, base, theirs });
     at = end;
   }
-  return blocks;
+  return regions;
 }
 
 /**

@@ -4,6 +4,11 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-09-26 — `ensureShadow` refuses a data dir inside the repository
+
+- **Done.** Checked after the source is resolved and before the shadow is asked anything, on refresh as well as creation, so a clone a symlink has since moved inside is refused too. The checkout, its git dir, a linked worktree's main checkout and a git dir kept apart are all protected; five mutations of the check all die.
+- **Decided — one check, not two.** The pool's refusal moved to `shadow.ts` as `watchedDirHolding` and both call it. Four pool tests built their shadow inside the checkout, which is now refused first; they reach the pool's check through a `worktrees/` symlink instead, the case only the pool can see.
+
 ## 2026-09-26 — third review of the classifier: four taken, three stale
 
 - **Taken — a side's unplaced region shifted every later span onto the wrong region.** Nulls were dropped before pairing, so A's span for region 2 sat beside B's for region 1, and the omitted count missed regions placed on one side only. Spans are region-aligned now, with a null where a side has none; the count is regions without a span on both sides, the bound included.

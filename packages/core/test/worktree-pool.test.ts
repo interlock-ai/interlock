@@ -376,7 +376,7 @@ describe('worktree pool', () => {
 
       const error = await rejection(request(newKey(), a, baseSha));
 
-      expect(error.code).toBe('SHADOW_UNAVAILABLE');
+      expect(error.code).toBe('CONFIG_INVALID');
       expect(existsSync(dataDir)).toBe(false);
     });
 
@@ -388,7 +388,7 @@ describe('worktree pool', () => {
 
       const error = await rejection(look(open(), slotRequest));
 
-      expect(error.code).toBe('SHADOW_UNAVAILABLE');
+      expect(error.code).toBe('CONFIG_INVALID');
       expect(readdirSync(join(dir, 'inside'))).toStrictEqual([]);
     });
 
@@ -419,7 +419,7 @@ describe('worktree pool', () => {
         }),
       );
 
-      expect(error.code).toBe('SHADOW_UNAVAILABLE');
+      expect(error.code).toBe('CONFIG_INVALID');
       expect(readdirSync(join(dir, 'inside'))).toStrictEqual([]);
     });
 
@@ -457,7 +457,7 @@ describe('worktree pool', () => {
         }),
       );
 
-      expect(error.code).toBe('SHADOW_UNAVAILABLE');
+      expect(error.code).toBe('CONFIG_INVALID');
       expect(readdirSync(join(apart, 'inside'))).toStrictEqual([]);
     });
 
@@ -1124,7 +1124,7 @@ describe('worktree pool', () => {
 
       const error = await rejection(look(open(), slotRequest));
 
-      expect(error.code).toBe('SHADOW_UNAVAILABLE');
+      expect(error.code).toBe('CONFIG_INVALID');
       expect(readdirSync(join(dir, 'inside'))).toStrictEqual([]);
     });
 

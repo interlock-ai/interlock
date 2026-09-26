@@ -14,8 +14,9 @@ import { InterlockError, isUlid, silentLogger, ULID_PATTERN } from '@interlock/s
 import type { Logger, MergePairKey, RepoId } from '@interlock/shared';
 import type { SpeculativeMergeResult } from '../merge/speculative-merge.js';
 import { assertObjectId, runRequired } from './repo-handle.js';
-import type { GitRunner, ShadowRepo } from './repo-handle.js';
-import { alternatesOf, shadowPathFor, watchedDirHolding } from './shadow.js';
+import type { GitRunner, ShadowRepo, UserRepo } from './repo-handle.js';
+import { dirHolding, repositoryDirsOf } from './repo-dirs.js';
+import { alternatesOf, shadowPathFor } from './shadow.js';
 
 /**
  * The per-pair worktree pool: a few persistent checkouts cut from the shadow,
@@ -297,15 +298,22 @@ export function createWorktreePool(shadow: ShadowRepo, options: WorktreePoolOpti
    * a symlink leading into one.
    */
   const load = async (): Promise<string> => {
-    const within = watchedDirHolding(poolPath, shadow.originPath, alternatesOf(shadow.rootPath));
-    if (within !== null) {
+    // The origin is read, never written: the runner takes a user handle for
+    // read-only commands, and reads nothing from it but `rootPath`.
+    const origin: UserRepo = { kind: 'user', rootPath: shadow.originPath, gitDir: '' };
+    const objects = alternatesOf(shadow.rootPath);
+    const dirs = [
+      shadow.originPath,
+      ...(objects === null ? [] : [objects]),
+      ...(await repositoryDirsOf(origin, runner)),
+    ];
+    if (dirHolding(poolPath, dirs) !== null) {
       throw new InterlockError(
-        'SHADOW_UNAVAILABLE',
+        'CONFIG_INVALID',
         'Refused to put worktrees inside the repository being watched',
         {
           details: { repoId },
           remedy: 'Move the data dir outside every watched repository.',
-          infra: true,
         },
       );
     }

@@ -334,6 +334,61 @@ describe('daemon', () => {
     expect(daemon.runtime).toBeNull();
   });
 
+  describe('a data directory inside a watched repository', () => {
+    /** Refused before the lock: no data dir, no listener, the checkout as git sees it. */
+    const expectRefused = async (at: string, repos: string[], checkout: string): Promise<void> => {
+      const status = git(checkout, 'status', '--porcelain', '--ignored');
+      const refused = createDaemon({
+        config: resolveConfig({ dataDir: at, repos, daemon: { port: 0 } }),
+        logger: createLogger('test', { level: 'error', sink: () => undefined }),
+      });
+
+      const error = await rejection(refused.start());
+
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.infra).toBe(false);
+      expect(error.remedy).toContain('INTERLOCK_DATA_DIR');
+      expect(existsSync(at)).toBe(false);
+      expect(refused.runtime).toBeNull();
+      expect(git(checkout, 'status', '--porcelain', '--ignored')).toBe(status);
+    };
+
+    it('is refused before anything is written', async () => {
+      await expectRefused(join(root, '.interlock'), [root], root);
+    });
+
+    it('is refused inside any watched repository, not only the first', async () => {
+      const other = join(base, 'other');
+      execFileSync('git', ['init', '-q', '-b', 'main', other], { stdio: 'pipe' });
+
+      await expectRefused(join(other, '.interlock'), [root, other], other);
+    });
+
+    it('is refused inside the main checkout when a linked worktree is what is watched', async () => {
+      git(root, 'branch', 'feature');
+      const linked = join(base, 'linked');
+      git(root, 'worktree', 'add', '-q', linked, 'feature');
+
+      await expectRefused(join(root, '.interlock'), [linked], root);
+    });
+
+    it('is refused inside a watched path that is not a repository yet', async () => {
+      const later = join(base, 'later');
+      mkdirSync(later);
+      const refused = createDaemon({
+        config: resolveConfig({
+          dataDir: join(later, 'data'),
+          repos: [later],
+          daemon: { port: 0 },
+        }),
+        logger: createLogger('test', { level: 'error', sink: () => undefined }),
+      });
+
+      expect((await rejection(refused.start())).code).toBe('CONFIG_INVALID');
+      expect(readdirSync(later)).toStrictEqual([]);
+    });
+  });
+
   it('hands the directory to the next daemon once the first has stopped', async () => {
     await daemon.start();
     await daemon.stop();

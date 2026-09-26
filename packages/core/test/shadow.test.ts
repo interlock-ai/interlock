@@ -7,6 +7,7 @@ import {
   realpathSync,
   rmSync,
   readdirSync,
+  renameSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -492,8 +493,9 @@ describe('ensureShadow', () => {
 
       const error = await rejection(ensureShadow(user, { runner, dataDir: at, repoId }));
 
-      expect(error.code).toBe('SHADOW_UNAVAILABLE');
-      expect(error.infra).toBe(true);
+      expect(error.code).toBe('CONFIG_INVALID');
+      // A mistake in configuration the user can correct, not a broken environment.
+      expect(error.infra).toBe(false);
       expect(existsSync(at)).toBe(false);
       expect(gitIn(checkout, 'status', '--porcelain', '--ignored')).toBe(status);
     };
@@ -509,6 +511,25 @@ describe('ensureShadow', () => {
     it('is refused inside the main checkout of a linked worktree', async () => {
       // The linked worktree is the origin; the main checkout is named only by
       // the store the shadow would borrow.
+      git('branch', 'feature');
+      const linked = join(base, 'linked');
+      git('worktree', 'add', '-q', linked, 'feature');
+      const worktreeRepo: UserRepo = {
+        kind: 'user',
+        rootPath: linked,
+        gitDir: join(dir, '.git', 'worktrees', 'linked'),
+      };
+
+      await expectRefused(worktreeRepo, join(dir, 'interlock-data'), dir);
+    });
+
+    it('is refused inside the main checkout when its object store lives elsewhere', async () => {
+      // The store is a symlink out of the git directory, so the directory above
+      // the resolved store is neither the git directory nor the main checkout.
+      const store = join(base, 'relocated', 'objects');
+      mkdirSync(join(base, 'relocated'));
+      renameSync(join(dir, '.git', 'objects'), store);
+      symlinkSync(store, join(dir, '.git', 'objects'));
       git('branch', 'feature');
       const linked = join(base, 'linked');
       git('worktree', 'add', '-q', linked, 'feature');
@@ -539,7 +560,7 @@ describe('ensureShadow', () => {
 
       const error = await rejection(ensureShadow(repo, { runner, dataDir: link, repoId }));
 
-      expect(error.code).toBe('SHADOW_UNAVAILABLE');
+      expect(error.code).toBe('CONFIG_INVALID');
       expect(readdirSync(join(dir, 'inside'))).toStrictEqual([]);
     });
 
@@ -557,10 +578,14 @@ describe('ensureShadow', () => {
         ensureShadow(repo, { runner: calls.runner, dataDir: join(base, 'link'), repoId }),
       );
 
-      expect(error.code).toBe('SHADOW_UNAVAILABLE');
+      expect(error.code).toBe('CONFIG_INVALID');
       expect(readdirSync(join(dir, 'inside'))).toStrictEqual([]);
-      // Refused before the shadow is asked anything, let alone written.
-      expect(calls.calls.map((args) => args[0])).toStrictEqual(['rev-parse']);
+      // Refused having asked the user repository only, and the shadow nothing.
+      expect(calls.calls.map((args) => args[0])).toStrictEqual([
+        'rev-parse',
+        'worktree',
+        'rev-parse',
+      ]);
     });
 
     it('is accepted beside the checkout, under a name the checkout’s is a prefix of', async () => {

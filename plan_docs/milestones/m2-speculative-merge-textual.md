@@ -314,7 +314,7 @@ merge-tree` over the two commits reports the conflict — with neither side
       **Files:** `packages/core/src/git/shadow.ts`
       **What:** refuse to create or refresh a shadow whose path resolves inside the checkout it mirrors, or inside that checkout's git directory, before anything is written.
       **Done when:** a data dir inside the checkout, one inside the main checkout of a linked worktree, and one reached through a symlink are each refused with nothing created, matching the pool's refusal.
-      **Constraints:** hard rule 1. A data dir configured inside a checkout would put the whole bare clone into the user's worktree as untracked files. One check serves both: `watchedDirHolding` in `shadow.ts`, which the pool calls too.
+      **Constraints:** hard rule 1. A data dir configured inside a checkout would put the whole bare clone into the user's worktree as untracked files. The daemon refuses such a data dir at start, before it writes anything; the shadow and the pool refuse again for a path handed to them directly. All three ask git for the repository's directories through `repositoryDirsOf`.
 
 - [ ] **Scheduler v1**
       **Files:** `packages/daemon/src/scheduler/`

@@ -4,7 +4,7 @@ import type { GitRunner } from '@interlock/core';
 import { INTERLOCK_PROTOCOL_VERSION, notImplemented } from '@interlock/shared';
 import type { DaemonRuntime, EventRecord, InterlockConfig, Logger } from '@interlock/shared';
 import { createApiServer } from './api/index.js';
-import { holdDataDir } from './data-dir.js';
+import { holdDataDir, refuseDataDirInRepos } from './data-dir.js';
 import type { DataDirHold } from './data-dir.js';
 import type { ApiServer } from './api/index.js';
 import { EventBus } from './bus/index.js';
@@ -65,6 +65,8 @@ export function createDaemon(options: DaemonOptions): Daemon {
   const { config } = options;
 
   let hold: DataDirHold | null = null;
+  /** Set across the one await before `hold` is taken, so two starts cannot both pass. */
+  let starting = false;
   let store: Store | null = null;
   let api: ApiServer | null = null;
   let watcher: Watcher | null = null;
@@ -107,13 +109,21 @@ export function createDaemon(options: DaemonOptions): Daemon {
     },
 
     async start(): Promise<void> {
-      if (hold !== null) throw new Error('the daemon is already started');
-
-      // First, so a second daemon is turned away before it touches anything
-      // the first one owns — the store's migrations included.
-      hold = holdDataDir(config.dataDir, log);
-      const bus = new EventBus({ logger: options.logger, onRecord: append });
+      if (hold !== null || starting) throw new Error('the daemon is already started');
+      starting = true;
       const runner = options.runner ?? createGitRunner();
+
+      try {
+        // Before the lock, which is the first thing written to the data dir.
+        await refuseDataDirInRepos(config.dataDir, config.repos, runner);
+        // First of what is written, so a second daemon is turned away before
+        // it touches anything the first one owns — the store's migrations
+        // included.
+        hold = holdDataDir(config.dataDir, log);
+      } finally {
+        starting = false;
+      }
+      const bus = new EventBus({ logger: options.logger, onRecord: append });
 
       try {
         store = await openStore({ path: join(config.dataDir, DATABASE_FILENAME), logger: log });

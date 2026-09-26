@@ -1,8 +1,9 @@
 import { chmodSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { InterlockError } from '@interlock/shared';
 import type { RepoId } from '@interlock/shared';
-import { isWithin, runRequired } from './repo-handle.js';
+import { dirHolding, repositoryDirsOf } from './repo-dirs.js';
+import { runRequired } from './repo-handle.js';
 import type { GitRunner, ShadowRepo, UserRepo } from './repo-handle.js';
 
 /**
@@ -143,15 +144,17 @@ async function refresh(
   const originPath = originPathOf(repo);
   const source = await sourceOf(repo, options.runner);
   // Before anything is written: a clone inside the checkout is the whole
-  // store written into the user's worktree as untracked files.
-  if (watchedDirHolding(shadowPath, originPath, source.objectsDir) !== null) {
+  // store written into the user's worktree as untracked files. The daemon
+  // refuses such a data dir before it starts; a caller handing a path here
+  // directly is refused the same way.
+  const dirs = [originPath, source.objectsDir, ...(await repositoryDirsOf(repo, options.runner))];
+  if (dirHolding(shadowPath, dirs) !== null) {
     throw new InterlockError(
-      'SHADOW_UNAVAILABLE',
+      'CONFIG_INVALID',
       'Refused to put a shadow clone inside the repository being watched',
       {
         details: { repoId: options.repoId },
         remedy: 'Move the data dir outside every watched repository.',
-        infra: true,
       },
     );
   }
@@ -282,52 +285,6 @@ async function isUsableShadow(
   if (bare !== 'true' || objectFormat !== source.objectFormat) return false;
 
   return alternatesOf(shadow.rootPath) === source.objectsDir;
-}
-
-/**
- * The user directory `path` would resolve inside, or null if none.
- *
- * The checkout being mirrored, and the git directory holding the store it
- * borrows — which for a linked worktree is the main checkout's, a directory the
- * origin path does not name — together with that main checkout. `path` need not
- * exist yet, so the deepest part of it that does is what resolves, and the rest
- * is joined back on.
- */
-export function watchedDirHolding(
-  path: string,
-  originPath: string,
-  objectsDir: string | null,
-): string | null {
-  const target = resolveDeepest(path);
-  const dirs = [originPath];
-  if (objectsDir !== null) {
-    const gitDir = dirname(objectsDir);
-    dirs.push(gitDir);
-    if (basename(gitDir) === '.git') dirs.push(dirname(gitDir));
-  }
-  return dirs.find((dir) => isWithin(resolveDeepest(dir), target)) ?? null;
-}
-
-/**
- * `path` with its deepest existing ancestor resolved and the rest joined back.
- *
- * Any failure to resolve is read as "does not exist yet", unreadable included:
- * a directory this process cannot read is one it cannot create anything inside
- * either, so the refusal it might have missed is made by `mkdir` instead.
- */
-function resolveDeepest(path: string): string {
-  const rest: string[] = [];
-  let current = path;
-  for (;;) {
-    try {
-      return join(realpathSync(current), ...rest);
-    } catch {
-      const parent = dirname(current);
-      if (parent === current) return path;
-      rest.unshift(basename(current));
-      current = parent;
-    }
-  }
 }
 
 /** The object store a shadow borrows, as its alternates file names it, or null. */

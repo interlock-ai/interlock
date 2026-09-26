@@ -4,6 +4,14 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-09-27 — review of the data dir refusal: the daemon refuses first
+
+- **Taken — the daemon wrote into a data dir inside the repository before any shadow existed.** `holdDataDir`, the store and the token all write at start, and nothing calls `ensureShadow` yet. The daemon now refuses at start, before the lock, against every repository in `repos`: each worktree and the common git dir, asked of git, and a path that is not a repository yet as itself.
+- **Not as suggested — the check is not in `validateConfig`.** `shared` imports no sibling and validates values only; resolving paths and asking git belong to the daemon, which runs it first.
+- **Taken — `infra: true` was wrong.** A data dir in a repository is a configuration mistake the user corrects: `CONFIG_INVALID`, not infrastructure, at all three refusals.
+- **Taken — a repository's directories were derived from the object store's path.** A store symlinked elsewhere broke the derivation and missed a linked worktree's main checkout. `repositoryDirsOf` asks git for the worktree list and the common dir; the shadow, the pool and the daemon share it.
+- **Noted — dropping the common dir is an equivalent mutation.** For a git dir kept apart, git lists that dir itself as the main worktree, and every other layout keeps it inside one. Kept as an explicit answer rather than resting on that listing.
+
 ## 2026-09-26 — `ensureShadow` refuses a data dir inside the repository
 
 - **Done.** Checked after the source is resolved and before the shadow is asked anything, on refresh as well as creation, so a clone a symlink has since moved inside is refused too. The checkout, its git dir, a linked worktree's main checkout and a git dir kept apart are all protected; five mutations of the check all die.

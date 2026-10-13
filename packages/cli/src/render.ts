@@ -1,3 +1,4 @@
+import { wrapUntrusted } from '@interlock/shared';
 import type {
   AgentSession,
   BranchRef,
@@ -6,7 +7,7 @@ import type {
   Repo,
   SpanEvidence,
 } from '@interlock/shared';
-import type { CheckReport } from './client/index.js';
+import type { BudgetReport, BudgetWindow, CheckReport, CollectionState } from './client/index.js';
 
 /**
  * Turning what the daemon reports into something a terminal can show.
@@ -22,6 +23,8 @@ export type BranchState = 'clean' | 'dirty' | 'unknown';
 export interface RenderOptions {
   /** Files listed under one branch before the rest are summarised. */
   readonly fileLimit?: number;
+  /** The instant a hold is measured to, in epoch milliseconds. */
+  readonly now?: number;
 }
 
 /**
@@ -107,6 +110,48 @@ export interface RepoView {
   readonly branches: readonly BranchRef[];
   /** Live agent sessions, joined onto branches by `sessionId`. */
   readonly sessions: readonly AgentSession[];
+  /** The shadow collection's live state; left out when the daemon could not say. */
+  readonly collection?: CollectionState;
+}
+
+/** A duration as a person reads it: `450 ms`, `1.2 s`, `42 s`, `3 min 5 s`. */
+export function durationText(ms: number): string {
+  if (ms < 1_000) return `${String(Math.max(0, Math.round(ms)))} ms`;
+  if (ms < 10_000) return `${(Math.floor(ms / 100) / 10).toFixed(1)} s`;
+  const seconds = Math.floor(ms / 1_000);
+  if (seconds < 60) return `${String(seconds)} s`;
+  return `${String(Math.floor(seconds / 60))} min ${String(seconds % 60)} s`;
+}
+
+/**
+ * A repository's collection, as far as a person needs it: a hold, because it
+ * is why a warning is late; a failing collection, because the shadow then
+ * grows with nobody told; and the last one's pause. Pinning and waiting for a
+ * lull hold nothing up, so they are left to `--json`.
+ */
+function collectionLines(collection: CollectionState, now: number): string[] {
+  const lines: string[] = [];
+  if (collection.phase === 'holding' && collection.since !== null) {
+    lines.push(
+      `  checks held for shadow collection — ${durationText(now - Date.parse(collection.since))}`,
+    );
+  }
+  if (collection.failing !== null) {
+    const { failures, retryAt, reason } = collection.failing;
+    // The reason is git's own message, which can quote a path the repository named.
+    lines.push(
+      `  warning: shadow collection failed ${String(failures)} time${failures === 1 ? '' : 's'} in a row, next attempt ${utcMinute(retryAt)}: ${safeText(reason)}`,
+    );
+  }
+  if (collection.last !== null) {
+    lines.push(
+      `  last shadow collection ${utcMinute(collection.last.endedAt)}, checks held ${durationText(collection.last.pausedMs)}`,
+    );
+  } else if (collection.phase !== 'holding') {
+    // Beside a hold it would read as a contradiction: the first is under way.
+    lines.push('  no shadow collection yet');
+  }
+  return lines;
 }
 
 /**
@@ -149,14 +194,14 @@ export function renderStatus(views: readonly RepoView[], options: RenderOptions 
   }
 
   const limit = options.fileLimit ?? DEFAULT_FILE_LIMIT;
+  const now = options.now ?? Date.now();
   const lines: string[] = [];
 
   for (const [index, view] of views.entries()) {
     if (index > 0) lines.push('');
-    lines.push(
-      `${safeText(view.repo.rootPath)}  (default ${safeText(view.repo.defaultBranch)})`,
-      '',
-    );
+    lines.push(`${safeText(view.repo.rootPath)}  (default ${safeText(view.repo.defaultBranch)})`);
+    if (view.collection !== undefined) lines.push(...collectionLines(view.collection, now));
+    lines.push('');
 
     if (view.branches.length === 0) {
       lines.push('  no branches');
@@ -210,14 +255,17 @@ export function renderStatus(views: readonly RepoView[], options: RenderOptions 
  * keeps both: it is still JSON, `JSON.parse` returns the identical string, and
  * nothing reading the raw bytes ever sees a control character.
  */
-export function renderJson(views: readonly RepoView[]): string {
+export function renderJson(views: readonly RepoView[], budget?: BudgetReport): string {
   return `${escapeControls(
     JSON.stringify(
       {
+        ...(budget === undefined ? {} : { budget }),
         repos: views.map((view) => ({
           id: view.repo.id,
           rootPath: view.repo.rootPath,
           defaultBranch: view.repo.defaultBranch,
+          // Null when the daemon could not say, which is not "never collected".
+          collection: view.collection ?? null,
           branches: view.branches.map((branch) => ({
             name: branch.name,
             ref: branch.ref,
@@ -357,20 +405,35 @@ function lineRange(startLine: number, endLine: number): string {
  * Everything the repository chose — branch names, paths, excerpts, the merge
  * base it named — goes through `safeText`, a line at a time, so an excerpt
  * keeps its shape and no line of it can move the cursor.
+ *
+ * Each excerpt is also quoted as untrusted data. `check` is a gate agents run,
+ * so what it prints is read by a model, and an excerpt is another branch's code
+ * — a comment in it can be written to the agent reading it. Names and paths are
+ * one escaped line each and stay unwrapped, which `docs/threat-model.md` keeps
+ * as a residual risk.
  */
 export function renderCheck(report: CheckReport): string {
   const a = safeText(report.a.name);
   const b = safeText(report.b.name);
   const base = safeText(report.mergeBaseSha.slice(0, 12));
-  if (report.clean) return `${a} and ${b} merge cleanly  (merge base ${base})\n`;
+  const dismissed = report.dismissed.length;
+  if (report.clean && dismissed === 0) return `${a} and ${b} merge cleanly  (merge base ${base})\n`;
 
   const count = report.findings.length;
   const lines = [
-    `${a} and ${b}: ${String(count)} conflict${count === 1 ? '' : 's'}  (merge base ${base})`,
+    report.clean
+      ? `${a} and ${b}: no open conflicts, ${String(dismissed)} dismissed  (merge base ${base})`
+      : `${a} and ${b}: ${String(count)} conflict${count === 1 ? '' : 's'}  (merge base ${base})`,
   ];
   for (const finding of report.findings) {
     const view = findingView(finding, report);
-    lines.push('', `${safeText(view.rule)} · ${safeText(view.severity)}  ${safeText(view.title)}`);
+    lines.push(
+      '',
+      `${safeText(view.rule)} · ${safeText(view.severity)}  ${safeText(view.title)}`,
+      // What `interlock dismiss` takes. The whole id: a prefix is ambiguous
+      // between Findings raised in the same millisecond.
+      `  finding ${safeText(view.id)}`,
+    );
     const width = Math.max(...view.sides.map((side) => safeText(side.branch).length));
     for (const side of view.sides) {
       const name = safeText(side.branch).padEnd(width);
@@ -385,11 +448,23 @@ export function renderCheck(report: CheckReport): string {
       }
       for (const span of side.spans) {
         lines.push(`  ${name}  ${path}:${lineRange(span.startLine, span.endLine)}`);
-        for (const text of span.excerpt.split('\n')) {
-          if (span.excerpt === '') break;
+        if (span.excerpt === '') continue;
+        // Wrapped first and escaped last: the wrapping is for an agent reading
+        // the output, the escaping for the terminal that acts on it, and the
+        // terminal sees the text after everything else has.
+        for (const text of wrapUntrusted(span.excerpt).split('\n')) {
           lines.push(`  ${' '.repeat(width)}    │ ${safeText(text)}`);
         }
       }
+    }
+  }
+  if (dismissed > 0) {
+    lines.push('', `Dismissed, and not raised while both sides stay unchanged:`);
+    for (const finding of report.dismissed) {
+      const path = conflictPath(finding);
+      lines.push(
+        `  ${safeText(finding.rule)}  ${path === null ? 'path unknown' : safeText(path)}  as ${finding.dismissal?.reason ?? 'unknown'}  finding ${safeText(finding.id)}`,
+      );
     }
   }
   lines.push('');
@@ -411,6 +486,130 @@ export function renderCheckJson(report: CheckReport): string {
         mergeBaseSha: report.mergeBaseSha,
         clean: report.clean,
         findings: report.findings.map((finding) => findingView(finding, report)),
+        dismissed: report.dismissed.map((finding) => ({
+          ...findingView(finding, report),
+          reason: finding.dismissal?.reason ?? null,
+          note: finding.dismissal?.note ?? null,
+          dismissedAt: finding.dismissal?.dismissedAt ?? null,
+        })),
+      },
+      null,
+      2,
+    ),
+  )}\n`;
+}
+
+/** Rules named under "most dismissed as wrong" before the rest are left out. */
+const LISTED_RULES = 5;
+
+/** `24 hours`, `7 days`: what a window is called, from what it is. */
+function windowName(hours: number): string {
+  return hours > 24 && hours % 24 === 0 ? `${String(hours / 24)} days` : `${String(hours)} hours`;
+}
+
+/** An instant to the minute, in UTC, said to be UTC: the window starts on the hour. */
+function utcMinute(instant: string): string {
+  return `${instant.slice(0, 10)} ${instant.slice(11, 16)} UTC`;
+}
+
+/** A rate as a person reads it, or "no data" — never 0% for nothing raised. */
+function rateText(rate: number | null): string {
+  return rate === null ? 'no data' : `${String(Math.round(rate * 100))}%`;
+}
+
+/**
+ * The false-positive budget as `interlock status` shows it: each window with
+ * the instant it starts, so the window printed is the window counted, and the
+ * rules with the most Findings dismissed as wrong — the bugs to open.
+ *
+ * Rule names come from the daemon, and are escaped like everything else it
+ * says.
+ */
+export function renderBudget(budget: BudgetReport): string {
+  const lines = [
+    'False positives: Findings dismissed as wrong, of those first raised in the window',
+    '',
+  ];
+  const labels = budget.windows.map((window) => `last ${windowName(window.hours)}`);
+  const width = Math.max('delivered'.length, ...labels.map((label) => label.length));
+  budget.windows.forEach((window, index) => {
+    const counts =
+      window.raised === 0
+        ? `0 raised, rate: ${rateText(window.rate)}`
+        : `${String(window.raised)} raised, ${String(window.dismissedWrong)} dismissed as wrong (${rateText(window.rate)}), ${String(window.dismissedKnown)} as known`;
+    lines.push(`  ${labels[index]!.padEnd(width)}  since ${utcMinute(window.since)}  ${counts}`);
+  });
+  lines.push(`  ${'delivered'.padEnd(width)}  not measured`);
+
+  const widest: BudgetWindow | undefined = budget.windows.at(-1);
+  if (widest !== undefined) {
+    const wrong = widest.rules.filter((rule) => rule.dismissedWrong > 0);
+    lines.push('');
+    if (wrong.length === 0) {
+      lines.push(
+        `  No rule had a Finding dismissed as wrong in the last ${windowName(widest.hours)}.`,
+      );
+    } else {
+      lines.push(`  Most dismissed as wrong, last ${windowName(widest.hours)}:`);
+      const shown = wrong.slice(0, LISTED_RULES);
+      const ruleWidth = Math.max(...shown.map((rule) => safeText(rule.rule).length));
+      for (const rule of shown) {
+        lines.push(
+          `    ${safeText(rule.rule).padEnd(ruleWidth)}  ${String(rule.dismissedWrong)} of ${String(rule.raised)} (${rateText(rule.rate)})`,
+        );
+      }
+      const hidden = wrong.length - shown.length;
+      if (hidden > 0) lines.push(`    … and ${String(hidden)} more`);
+    }
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
+/** The path a dismissed Finding's conflict is about, from its merge evidence. */
+function conflictPath(finding: Finding): string | null {
+  const conflict = finding.evidence.find(
+    (item): item is MergeConflictEvidence => item.type === 'merge-conflict',
+  );
+  return conflict?.path ?? null;
+}
+
+/**
+ * What `interlock dismiss` says it did, and how long it lasts. The path and
+ * the note are repository content and free text, so both are escaped.
+ */
+export function renderDismissal(finding: Finding): string {
+  const path = conflictPath(finding);
+  const reason = finding.dismissal?.reason ?? 'unknown';
+  const where = path === null ? '' : ` at ${safeText(path)}`;
+  const lines = [
+    `Dismissed ${safeText(finding.id)} as ${reason}: ${safeText(finding.rule)}${where}`,
+    path === null
+      ? 'It stays dismissed while both sides are unchanged.'
+      : `It stays dismissed while both sides of ${safeText(path)} are unchanged.`,
+  ];
+  const note = finding.dismissal?.note ?? null;
+  if (note !== null) {
+    for (const [index, text] of note.split('\n').entries()) {
+      lines.push(`${index === 0 ? 'note: ' : '      '}${safeText(text)}`);
+    }
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
+/** The same facts as {@link renderDismissal}, for a script. */
+export function renderDismissalJson(finding: Finding): string {
+  return `${escapeControls(
+    JSON.stringify(
+      {
+        id: finding.id,
+        kind: finding.kind,
+        rule: finding.rule,
+        path: conflictPath(finding),
+        reason: finding.dismissal?.reason ?? null,
+        note: finding.dismissal?.note ?? null,
+        dismissedAt: finding.dismissal?.dismissedAt ?? null,
       },
       null,
       2,

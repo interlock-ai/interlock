@@ -532,17 +532,95 @@ merge-tree` over the two commits reports the conflict — with neither side
   redaction every excerpt goes through and the models a Finding is made of. Any
   change in either, a comment included, is a miss.
 
-- [ ] **False-positive budget**
-      **Files:** `packages/daemon/src/store/`, `packages/core/src/advisor/`
-      **What:** count findings raised, findings delivered, and findings later dismissed or resolved as wrong. Expose the ratio.
-      **Done when:** the daemon can report its own false-positive rate for a time window, and `interlock status` shows it.
-      **Constraints:** the design rule is **when unsure, say nothing**. A tool that catches 60% of conflicts and never lies is a product; one that catches 95% and cries wolf twice a day is uninstalled within a week. Every false positive is a bug with an issue, not a tuning parameter. Decide what a dismissal means before counting one: reconciliation matches open Findings only, so today a dismissed conflict is raised again as a new Finding on the pair's next run — or cache hit, which reconciles the same way — and a dismissal lasts one run.
+- [x] **False-positive budget**
+      **Files:** `packages/shared/src/models/finding.ts`, `packages/shared/src/events/`, `packages/core/src/merge/conflict-classifier.ts`, `packages/daemon/src/store/`, `packages/daemon/src/api/`, `packages/daemon/src/scheduler/run-pipeline.ts`, `packages/daemon/src/dismiss.ts`, `packages/daemon/src/budget.ts`, `packages/cli/src/commands/`, `packages/cli/src/render.ts`, `docs/architecture.md`, `docs/threat-model.md`
+      **What:** measure how often Interlock is wrong — Findings raised against Findings a human dismissed as wrong — and make a dismissal last, so the same false positive is not raised again on every run.
 
-- [ ] **Show a shadow collection in `interlock status`**
-      **Files:** `packages/daemon/src/api/`, `packages/cli/src/commands/status.ts`, `packages/cli/src/render.ts`
-      **What:** while a repository's shadow is repacked its checks are held off, and today only the daemon's log says why an edit's warning is late. Surface a collection in progress, and the last one's pause, per repository.
-      **Done when:** `interlock status` names a repository whose checks are held for a collection, with how long it has been; `--json` carries the same; the API carries it without a store migration, since it is live state.
-      **Constraints:** read the pause from the registry's own measure (`pausedMs`), not a guess. Worth doing once the bench records the pause at the default window: under realistic load it measured about a second.
+  Rewritten before starting, from reading the pipeline, the store and
+  retention. Two premises of the first draft were wrong: `core/src/advisor/`
+  has nothing to do with it, and nothing delivers Findings yet, so a
+  "delivered" count would be a zero standing in for "not measured".
+  **A dismissal's identity** is the conflict's `textualFindingKey` (rule,
+  pair, path) at its content: each side's blob oid from the `merge-conflict`
+  evidence, null for a side that deleted the file, read by branch id and never
+  by position, since a Finding's attribution may name the pair the other way
+  round. A Finding with no key — no textual Finding lacks one, and no other
+  kind exists yet — is refused, not dismissed alone: one that cannot be
+  matched again would last one run, which is the bug being fixed.
+  **Where it applies:** in `reconcileFindings`, which a run and a cache hit
+  both go through. A found Finding matching a live dismissal on key and
+  content raises nothing and leaves the dismissal as it is. A live dismissal
+  the run does not find at its content has stopped reproducing: it is ended —
+  `resolvedAt` set, status kept, a `finding.resolved` with
+  `no-longer-reproduces` — and a later return of the conflict is a new Finding,
+  even at the dismissed content. Planning treats a pair with a live dismissal
+  as it treats one with an open Finding, so a run comes round to end it.
+  **Model and event:** `Finding.dismissal` (`reason` `wrong` or `known`, an
+  optional note of at most 500 characters, `dismissedAt`), migration 005. A
+  dismissed Finding is written only by the dismissal and by its ending: a run
+  that read it open before the dismissal landed cannot write it back open. A
+  `finding.dismissed` event carries the reason and the run, caused by the
+  Finding's own `finding.raised`.
+  **Counting:** a counters table by UTC hour, kind and rule, incremented in
+  the transaction that raises or dismisses, never pruned. Raised is distinct
+  Finding ids first raised. A dismissal is counted in the hour its Finding was
+  first raised, so a window's rate is of the Findings raised in it — a cohort,
+  never above 100%, which can still rise as later dismissals come in. Only
+  `wrong` counts as false; `known` is counted beside it; `no-longer-reproduces`
+  is neither. The windows are the last 24 and 168 whole UTC hours including
+  the current one, and the report states the instant each starts. Zero raised
+  is no data, never 0%. Daemon-wide, per rule and overall: a detector's bug is
+  not a repository's.
+  **Names:** `interlock check` prints each Finding's id; `dismiss` takes the
+  whole id. No prefix: ULIDs made in one millisecond share their first ten
+  characters, so a short prefix is ambiguous exactly when Findings come
+  together. **Undismiss** is out of scope: a mistaken dismissal ends when
+  either side changes. **`check`** lists dismissed conflicts that still stand
+  beside the open ones; they leave the pair clean, so a dismissal does not keep
+  failing a gate.
+
+  **Done when:** `POST /api/findings/:id/dismiss` and `interlock dismiss <id>
+--reason wrong|known [--note <text>]` dismiss an open or stale Finding; exits are 0
+  dismissed, 64 for bad arguments, an unknown Finding, or one already resolved,
+  already dismissed or with no identity, 69 for no daemon, 70 for anything else;
+  dismissed content run again, or answered from the cache, raises nothing;
+  either side's blob changing raises a new Finding; `GET /api/budget` and
+  `interlock status` (and `--json`) report raised, dismissed as wrong, dismissed
+  as known, the rate or "no data", and the most-dismissed rules for both
+  windows with their start, and "delivered" as not measured, never 0; the
+  counts survive a retention pass; a live dismissal's run, events and evidence
+  commits survive retention and shadow collection, an ended one's do not;
+  tested end to end against a real daemon on a temp data dir.
+  **Constraints:** when unsure, say nothing. The rate is a signal for fixing
+  detectors and never a threshold that suppresses output; every false positive
+  is a bug with an issue. A third write route — it changes a Finding and the
+  counts — is a security-posture question: the same token, loopback only, a
+  4 KiB body, every field validated, unknown keys refused, the reason an enum,
+  the note bounded and escaped before a terminal prints it; flagged in the PR
+  for a human decision and recorded in the threat model. `interlock status`
+  keeps never failing on Findings.
+
+- [x] **Show a shadow collection in `interlock status`**
+      **Files:** `packages/daemon/src/shadows.ts`, `packages/daemon/src/api/`, `packages/daemon/src/daemon.ts`, `packages/cli/src/client/`, `packages/cli/src/commands/status.ts`, `packages/cli/src/render.ts`, `docs/architecture.md`
+      **What:** while a repository's shadow is repacked its checks are held off, and today only the daemon's log says why an edit's warning is late. Surface a collection in progress, the last one's pause, and a collection that keeps failing, per repository.
+      **Done when:** `interlock status` names a repository whose checks are held for a collection, with how long it has been; shows the last collection's pause; warns when collections are failing, with when the next attempt is; `--json` carries the same, and the phases that hold nothing up; the API carries it without a store migration, since it is live state, and a restarted daemon reads "no collection yet".
+
+  Rewritten before starting, from the issue. **One live record per
+  repository, owned by the registry:** the phase (`idle`, `pinning`,
+  `waiting-for-quiet`, `holding`) and when it began, set where the code already
+  changes state — before the pin, before the wait for quiet, inside `alone()`
+  once new holders wait, and `idle` in the `finally` that releases the gate, so
+  a failed or stopped collection never reads as holding; the last finished
+  collection (end, `pausedMs`, `quietMs`, sizes before and after); and the
+  collector's backoff (failures in a row, next attempt, last reason through
+  `redact()`). **Served from `GET /api/repos/:id/collection`**, read
+  synchronously, behind the same token; an unknown repository is
+  `REPO_NOT_FOUND`. **Human output:** only `holding` gets a line, since only it
+  delays a warning; a failing collection is a warning whatever the phase; the
+  last pause or "no shadow collection yet". The CLI validates the record field
+  by field, and a daemon without the route leaves the branch report intact, as
+  for the budget.
+  **Constraints:** read the pause from the registry's own measure (`pausedMs`), not a guess. A read-only `GET`, so the security posture does not change. Measured by the bench at about a second under realistic load.
 
 - [x] **`interlock check A B`**
       **Files:** `packages/cli/src/commands/`, `packages/cli/src/client/`, `packages/cli/src/render.ts`, `packages/daemon/src/api/server.ts`, `packages/daemon/src/scheduler/`, `packages/daemon/src/watcher/`, `packages/daemon/src/check.ts`, `docs/architecture.md`, `docs/threat-model.md`
@@ -591,11 +669,32 @@ merge-tree` over the two commits reports the conflict — with neither side
   without `wrapUntrusted`. Recorded in `docs/architecture.md` and the threat
   model.
 
-- [ ] **Wrap the excerpts `interlock check` prints**
-      **Files:** `packages/shared/src/`, `packages/mcp-server/src/sanitize.ts`, `packages/cli/src/render.ts`
-      **What:** `check` prints other branches' code, and agents are who will run it as a gate; the excerpts are escaped for the terminal but reach the agent as plain output, not as untrusted data. Move `wrapUntrusted` into `shared` — it depends on nothing — so the CLI and the MCP server use one implementation, and wrap each excerpt block in the human output.
-      **Done when:** an excerpt holding an instruction-shaped line prints neutralised and inside the untrusted-content delimiters; the MCP server's own tests pass unchanged against the moved function; `--json` keeps excerpts as data, unwrapped, since a script parses them; threat model T12's residual risk no longer names this.
-      **Constraints:** hard rule 4. The terminal escaping stays: wrapping is about an agent reading, escaping about a terminal acting.
+- [x] **Wrap the excerpts `interlock check` prints**
+      **Files:** `packages/shared/src/sanitize.ts`, `packages/mcp-server/src/sanitize.ts`, `packages/cli/src/render.ts`, `docs/threat-model.md`
+      **What:** `check` prints other branches' code, and agents are who will run it as a gate; the excerpts are escaped for the terminal but reach the agent as plain output, not as untrusted data. Move `wrapUntrusted` into `shared` — it depends on nothing — so the CLI and the MCP server use one implementation, with `mcp-server/src/sanitize.ts` a re-export, and wrap each excerpt block in the human output: wrapped first, terminal-escaped last.
+
+  Rewritten before starting, from the issue: the task as written left the
+  function's own gap in place. Every pattern but the tag one was anchored to
+  the start of a line, and in source an injected instruction sits in a
+  comment, so `// ignore previous instructions` passed. **Matching** now reads
+  a line from its start and from after every comment opener (`//` not after a
+  colon, `/*`, `#`, `--`, `;`), with the comment's own markers stripped;
+  through NFKC and with invisible characters dropped; and with a run of tag
+  characters decoded and read as a sentence of its own. **Display** shows bidi
+  controls and tag characters as `\u{…}`. **Inventory:** every field the CLI
+  prints from a repository is either wrapped or has its reason in the threat
+  model.
+
+  **Done when:** an excerpt holding an instruction-shaped line prints
+  neutralised and inside the untrusted-content delimiters, at the start of a
+  line, in each comment style and after code on the same line, full-width,
+  zero-width and bidi-disguised; a line holding the delimiters cannot close the
+  block; the MCP server's own tests pass unchanged against the moved function;
+  `--json` keeps excerpts as data, unwrapped, since a script parses them; the
+  false-neutralisation count over every comment in this repository and in
+  archestra is measured, recorded and small; threat model T12's residual risk
+  no longer names this, and the inventory is in the threat model.
+  **Constraints:** hard rule 4. The terminal escaping stays: wrapping is about an agent reading, escaping about a terminal acting. `shared` stays dependency-free.
 
 - [x] **Fixture suite**
       **Files:** `eval/fixtures/`, `eval/run.ts`, `eval/reports/`, `eval/README.md`, `vitest.config.ts`
@@ -650,7 +749,8 @@ merge-tree` over the two commits reports the conflict — with neither side
   git runs with no global or system config, so neither the user's repository
   nor their configuration shapes a result.
 
-- [ ] **Turn the coverage gate on**
+- [x] **Coverage gate, per package**
       **Files:** `vitest.config.ts`, `.github/workflows/ci.yml`
-      **What:** restore the `packages/core/src/**` threshold at 80% lines and functions, and restore the `coverage` CI job that runs it.
-      **Done when:** CI fails when `core` drops below the threshold. Both were removed while `core` was mostly declarations — the gate measured nothing and the job discarded its own output. By now there is an implementation to measure.
+      **What:** the global floor and the CI coverage cell already exist; a single global floor lets one package decay while the others carry the average. Give each package under `packages/` its own statements, branches and lines floors at its measured coverage rounded down to a whole percent, and a functions floor wherever stubs no longer make up its uncovered functions, with a comment where one is absent. The global floor stays as it is.
+      **Done when:** a run where one package drops below its own floor fails `pnpm verify` and CI while the global number still passes, shown once on a throwaway branch and discarded; the CI coverage cell runs the same `test:coverage` script, so the floors apply there with no workflow change.
+      **Constraints:** floors only go up. No coverage-ignore comments, no new exclusions. `eval/` and `scripts/` stay outside coverage.

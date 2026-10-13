@@ -4,8 +4,12 @@ import { INTERLOCK_PROTOCOL_VERSION, InterlockError, isInterlockError } from '@i
 import type { InterlockConfig, Logger, RepoId } from '@interlock/shared';
 import { parseSessionRegistration } from '../hooks/index.js';
 import type { SessionRegistry } from '../hooks/index.js';
+import { budgetReport } from '../budget.js';
 import { parseCheckRequest } from '../check.js';
 import type { Checks } from '../check.js';
+import { parseDismissRequest, parseFindingId } from '../dismiss.js';
+import type { Dismissals } from '../dismiss.js';
+import type { CollectionState } from '../shadows.js';
 import type { Store } from '../store/index.js';
 import { bearerToken, ensureToken, tokenMatches } from './token.js';
 
@@ -46,6 +50,13 @@ export interface ApiOptions {
    * then a check is refused as the daemon still starting.
    */
   readonly checks?: () => Checks | null;
+  /** What dismisses a Finding: the store and the bus, both up before the listener. */
+  readonly dismissals: Dismissals;
+  /**
+   * Where a repository's shadow collection is: live state the registry holds
+   * in memory, read synchronously, so the answer needs no lock.
+   */
+  readonly collections: (repoId: RepoId) => CollectionState;
   readonly logger: Logger;
 }
 
@@ -73,6 +84,13 @@ const MAX_BODY_BYTES = 16 * 1024;
 
 /** A check request is two branch names and a deadline. */
 const MAX_CHECK_BODY_BYTES = 4 * 1024;
+
+/**
+ * A dismissal is a reason and a note of at most 500 UTF-16 units, which JSON
+ * may spell as six bytes each: room for the longest note however it is
+ * written, and nothing like a file.
+ */
+const MAX_DISMISS_BODY_BYTES = 4 * 1024;
 
 /** Hostnames a loopback listener may legitimately be addressed by. */
 const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost']);
@@ -157,8 +175,9 @@ export function createApiServer(options: ApiOptions): ApiServer {
       });
     }
 
-    // The two routes that write, and the only two that read a body. Everything
-    // else answers `GET` alone, so nothing else becomes writable by accident.
+    // The three routes that write, and the only three that read a body.
+    // Everything else answers `GET` alone, so nothing else becomes writable by
+    // accident.
     if (
       segments.length === 4 &&
       segments[0] === 'api' &&
@@ -186,6 +205,23 @@ export function createApiServer(options: ApiOptions): ApiServer {
       });
       const check = await checks.run(segments[2] as RepoId, parsed, gone.signal);
       send(response, 200, { check });
+      return;
+    }
+
+    if (
+      segments.length === 4 &&
+      segments[0] === 'api' &&
+      segments[1] === 'findings' &&
+      segments[3] === 'dismiss'
+    ) {
+      if (request.method !== 'POST') {
+        methodNotAllowed(request, response, 'POST');
+        return;
+      }
+      const id = parseFindingId(segments[2]!);
+      const body = await readJsonBody(request, MAX_DISMISS_BODY_BYTES);
+      const finding = await options.dismissals.dismiss(id, parseDismissRequest(body));
+      send(response, 200, { finding });
       return;
     }
 
@@ -221,9 +257,14 @@ export function createApiServer(options: ApiOptions): ApiServer {
       return;
     }
 
+    if (matches(segments, ['api', 'budget'])) {
+      send(response, 200, { budget: await budgetReport(store) });
+      return;
+    }
+
     if (segments.length === 4 && segments[0] === 'api' && segments[1] === 'repos') {
       const [, , id, tail] = segments;
-      if (tail === 'branches' || tail === 'sessions') {
+      if (tail === 'branches' || tail === 'sessions' || tail === 'collection') {
         // Checked rather than assumed: `listBranchRefs` answers an empty list
         // for a repository that does not exist, which reads as "no branches"
         // instead of "no such repository".
@@ -236,6 +277,8 @@ export function createApiServer(options: ApiOptions): ApiServer {
         }
         if (tail === 'branches') {
           send(response, 200, { branches: await store.listBranchRefs(id as RepoId) });
+        } else if (tail === 'collection') {
+          send(response, 200, { collection: options.collections(id as RepoId) });
         } else {
           send(response, 200, { sessions: await sessions.listLive(id as RepoId) });
         }
@@ -479,8 +522,10 @@ function statusFor(error: InterlockError): number {
       return 401;
     case 'REPO_NOT_FOUND':
     case 'BRANCH_NOT_FOUND':
+    case 'FINDING_NOT_FOUND':
       return 404;
     case 'BRANCHES_UNRELATED':
+    case 'FINDING_NOT_DISMISSABLE':
       return 409;
     // Nobody is there to read it; the status says why the request ended.
     case 'REQUEST_CANCELLED':

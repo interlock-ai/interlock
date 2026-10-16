@@ -77,6 +77,12 @@ attributed one's 1, and keeps whatever evidence was established — the
 compiler's output always, and any span that could be placed. A wrong accusation
 costs more agent trust than a vague warning, so a guess is never the tiebreak.
 
+It is the merge's ground truth only because of what attribution is given: the
+baseline differ's output, the diagnostics present in the merged tree and absent
+from the merge base and from each branch alone. Given the type-check
+service's whole report, every error already on the default branch would come
+back as a Finding about the pair, at 0.5 where nothing else could be told.
+
 A **stale ChangeSet** is real, not theoretical: a side the scheduler captures
 again keeps the ChangeSet it had, against a new tree. For every path a decision
 reads, the blobs at the ChangeSet's base and at the merged commit are checked

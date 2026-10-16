@@ -1630,7 +1630,13 @@ export interface AttributionRequest {
   readonly merge: SpeculativeMergeRequest;
   /** The clean merge's tree, which the diagnostics were reported against. */
   readonly mergedTreeOid: string;
-  /** Paths relative to the tree, as the type-check service reports them. */
+  /**
+   * The diagnostics the merge introduced — the baseline differ's output, never
+   * the service's whole report. Every one becomes a Finding, attributed or
+   * not, so an error already on the default branch given here is reported as
+   * the pair's. Paths relative to the tree, as the type-check service reports
+   * them.
+   */
   readonly diagnostics: readonly FileDiagnostic[];
   /** ISO-8601; stamped on every Finding as first seen and updated. */
   readonly now: string;

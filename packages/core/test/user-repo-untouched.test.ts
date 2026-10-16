@@ -15,6 +15,7 @@ import { isInterlockError, makePairKey, ulid } from '@interlock/shared';
 import type { BranchRefId, SnapshotId, SpeculativeRunId } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  attributeDiagnostics,
   classifyTextualConflicts,
   captureDirtyState,
   commitSnapshotInShadow,
@@ -464,6 +465,76 @@ describe('user repositories are never modified', () => {
     const { findings } = await assertUntouched([root, linked]);
 
     expect(findings).toBeGreaterThan(0);
+  });
+
+  it('leaves the repository unchanged while attributing a diagnostic', async () => {
+    const root = join(base, 'repo');
+    const linked = join(base, 'linked');
+    init(root);
+    mkdirSync(join(root, 'src'));
+    const payments = 'export function processRefund(id: string): string {\n  return id;\n}\n';
+    commit(root, 'src/payments.ts', payments, 'base');
+    git(root, 'worktree', 'add', '-q', '-b', 'feature', linked);
+    commit(root, 'src/payments.ts', payments.replace('processRefund', 'refundPayment'), 'rename');
+    // Uncommitted, so the stale reference exists only in a snapshot.
+    writeFileSync(
+      join(linked, 'src/support.ts'),
+      'import { processRefund } from "./payments";\n\nexport const escalate = (id: string): string =>\n  processRefund(id);\n',
+    );
+    const before = new Map<string, RepoState>(
+      [root, linked].map((path) => [path, captureState(path)]),
+    );
+
+    // Every read attribution makes: the merged tree, the merge base, each side
+    // and each ChangeSet's own base, through the shadow and its alternates.
+    const handle = await openUserRepo(root, { runner });
+    const repo = await describeRepo(handle, { runner, dataDir });
+    const shadow = await ensureShadow(handle, { runner, dataDir, repoId: repo.id });
+    const branches = await listBranchRefs(handle, repo.id, { runner });
+    const main = branches.find((branch) => branch.name === 'main')!;
+    const feature = branches.find((branch) => branch.name === 'feature')!;
+    const mergeBaseSha = (await mergeBase(handle, feature.headSha, main.headSha, { runner }))!;
+    const snapshot = await captureDirtyState(linked, handle, { runner, objectStore: shadow });
+    const { commitSha } = await commitSnapshotInShadow(shadow, snapshot, { runner });
+    const merge = { shadow, commitA: main.headSha, commitB: commitSha, mergeBaseSha };
+    const merged = await speculativeMerge(merge, { runner });
+    const { findings } = await attributeDiagnostics(
+      {
+        runId: ulid<SpeculativeRunId>(),
+        branchA: main.id,
+        branchB: feature.id,
+        changeSetA: await extractChangeSet(handle, main, mergeBaseSha, { runner }),
+        changeSetB: await extractChangeSet(handle, feature, mergeBaseSha, {
+          runner,
+          snapshot: { id: ulid<SnapshotId>(), treeOid: snapshot.treeOid },
+          objectStore: shadow,
+        }),
+        merge,
+        mergedTreeOid: merged.treeOid,
+        diagnostics: [
+          {
+            code: 2305,
+            category: 'error',
+            message: "Module '\"./payments\"' has no exported member 'processRefund'.",
+            file: 'src/support.ts',
+            start: 9,
+            length: 13,
+            line: 1,
+            column: 10,
+          },
+        ],
+        now: new Date().toISOString(),
+      },
+      { runner },
+    );
+    // Attributed, so every read above was made rather than skipped.
+    expect(findings.map((finding) => finding.attribution.originBranch)).toEqual([main.id]);
+
+    for (const path of [root, linked]) {
+      const after = captureState(path);
+      const diff = diffState(before.get(path)!, after);
+      expect(isClean(diff), `${path}\n${describeDiff(diff, before.get(path)!, after)}`).toBe(true);
+    }
   });
 
   it('leaves .git/index, HEAD, refs, config and packed-refs unchanged', async () => {

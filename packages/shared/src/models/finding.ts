@@ -15,8 +15,9 @@ export interface Finding {
   readonly rule: string;
   readonly severity: Severity;
   /**
-   * 0–1. Sandbox verdicts (typecheck/build/test) are ground truth and sit at 1;
-   * AST heuristics report lower.
+   * 0–1. Sandbox verdicts (typecheck/build/test) are ground truth and sit at 1
+   * while they say which branch caused them; one that cannot say reports
+   * lower, as AST heuristics do.
    */
   readonly confidence: number;
   readonly status: FindingStatus;

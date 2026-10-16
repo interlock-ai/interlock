@@ -5,6 +5,7 @@ import { InterlockError, pathIgnored, silentLogger } from '@interlock/shared';
 import type { Logger } from '@interlock/shared';
 import { createDebouncer } from './debounce.js';
 import type { Debouncer } from './debounce.js';
+import { watchDirectoryTree } from './tree-watch.js';
 
 /**
  * The filesystem half of the watcher: a source of debounced change signals and
@@ -124,11 +125,21 @@ interface WatchedTarget {
   ignore: string[];
 }
 
+/**
+ * The kernel boundary as the daemon has it: `fs.watch`, except a recursive
+ * watch on Linux, which is {@link watchDirectoryTree}. Node's recursive mode
+ * there throws past its own `error` event when a watched directory loses its
+ * permissions; elsewhere it is the platform's native recursive watch, which
+ * does not. A flat watch — a git directory's top level — stays one watch.
+ */
+export const defaultWatchFactory: WatchFactory = (path, watchOptions) =>
+  watchOptions.recursive && process.platform === 'linux'
+    ? watchDirectoryTree(path)
+    : watch(path, { recursive: watchOptions.recursive, persistent: true });
+
 export function createWorktreeWatcher(options: WorktreeWatcherOptions): WorktreeWatcher {
   const log = (options.logger ?? silentLogger).child('watcher');
-  const watchFactory: WatchFactory =
-    options.watchFactory ??
-    ((path, watchOptions) => watch(path, { recursive: watchOptions.recursive, persistent: true }));
+  const watchFactory: WatchFactory = options.watchFactory ?? defaultWatchFactory;
   const targets = new Map<string, WatchedTarget>();
 
   const debouncer: Debouncer = createDebouncer({

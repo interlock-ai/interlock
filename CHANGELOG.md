@@ -41,3 +41,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Documentation: architecture, evaluation protocols, threat model, ADR-0001…0004, scheduler algorithm notes.
 - Evaluation harness entry point outside the workspace.
 - Licensing: AGPL-3.0-only with a commercial exception (ADR-0002).
+
+### Fixed
+
+- On Linux, a watched worktree — or any directory in it — losing its read permission no longer ends the daemon. Node's own recursive file watch throws an uncaught `EACCES` there, on Node 24 and 26 alike; the daemon now watches a worktree one directory at a time, keeps watching the rest of it when a directory inside becomes unreadable, and falls back to polling when the worktree itself does.

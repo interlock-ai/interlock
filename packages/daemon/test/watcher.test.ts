@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -15,7 +16,7 @@ import { basename, join, sep } from 'node:path';
 import { createLogger } from '@interlock/shared';
 import type { LogRecord } from '@interlock/shared';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createWorktreeWatcher } from '../src/watcher/worktree-watcher.js';
+import { createWorktreeWatcher, defaultWatchFactory } from '../src/watcher/worktree-watcher.js';
 import type {
   ChangeSignal,
   WatchFactory,
@@ -782,4 +783,68 @@ describe('worktree watcher', () => {
     expect(worktreeSignals()).toHaveLength(1);
     expect(worktreeSignals()[0]?.worktreePath).toBe(root);
   });
+
+  // Linux only: elsewhere the recursive watch is the platform's own, and it is
+  // Node's Linux one that throws. Not as root, whom a mode does not stop.
+  describe.runIf(process.platform === 'linux' && process.getuid?.() !== 0)(
+    'a directory losing its permissions, on Linux',
+    () => {
+      /** Put a mode back however a test ends, or the fixture cannot be removed. */
+      const withMode = async (path: string, run: () => Promise<void>): Promise<void> => {
+        try {
+          chmodSync(path, 0o000);
+          await run();
+        } finally {
+          chmodSync(path, 0o755);
+        }
+      };
+
+      it('falls back to polling, rather than crash, when the worktree itself does', async () => {
+        watcher.watch({ worktreePath: root, gitDir: join(root, '.git') });
+        await observe();
+
+        // Node's own recursive watch stats the root's name on this event and
+        // throws EACCES past every handler; the daemon used to exit here.
+        await withMode(root, async () => {
+          await settle();
+          // Nothing inside an unreadable root can be watched or named: the same
+          // answer as a root the OS refuses from the start.
+          expect(watcher.isDegraded(root)).toBe(true);
+        });
+      });
+
+      it('keeps a flat watch flat: a git directory’s top level is one watch, not a tree', async () => {
+        const names: (string | null)[] = [];
+        const flat = defaultWatchFactory(join(root, 'src'), { recursive: false });
+        flat.on('change', (_event, name) => names.push(typeof name === 'string' ? name : null));
+        try {
+          mkdirSync(join(root, 'src', 'nested'));
+          await settle();
+          names.length = 0;
+          writeFileSync(join(root, 'src', 'nested', 'deep.txt'), 'x\n');
+          await settle();
+          expect(names).toEqual([]);
+        } finally {
+          flat.close();
+        }
+      });
+
+      it('keeps watching the rest of the worktree when a directory inside does', async () => {
+        watcher.watch({ worktreePath: root, gitDir: join(root, '.git') });
+        await observe();
+
+        await withMode(join(root, 'src'), async () => {
+          await settle();
+          // Announced, and unnamed: what changed inside is what cannot be read.
+          expect(worktreeSignals().some((signal) => signal.paths.length === 0)).toBe(true);
+          expect(watcher.isDegraded(root)).toBe(false);
+
+          signals.length = 0;
+          writeFileSync(join(root, 'after.txt'), 'x\n');
+          await settle();
+          expect(worktreeSignals().flatMap((signal) => signal.paths)).toContain('after.txt');
+        });
+      });
+    },
+  );
 });

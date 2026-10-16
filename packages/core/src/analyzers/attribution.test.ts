@@ -625,4 +625,12 @@ describe('importing @interlock/core', () => {
       vi.resetModules();
     }
   });
+
+  it('does not expose what attribution shares with the textual classifier', async () => {
+    const core: Record<string, unknown> = await import('../index.js');
+    for (const name of ['BlobReader', 'looksBinary', 'MAX_ALIGN_EDITS']) {
+      expect(core).not.toHaveProperty(name);
+    }
+    expect(core).toHaveProperty('textualFindingKey');
+  });
 });

@@ -26,6 +26,7 @@ import {
   MAX_EXCERPT_CHARS,
   MAX_EXCERPT_LINES,
   MAX_FINDINGS_PER_RUN,
+  MAX_SPANS_PER_SIDE,
 } from '../src/merge/conflict-classifier.js';
 import {
   CHECKOUT,
@@ -140,6 +141,20 @@ describe("the evaluation suite's typecheck cases", () => {
     'signature-vs-caller': 'signature-changed',
     'moved-export-vs-import': 'moved',
   };
+  // A label marks the reference from its first line to its last. The lines of
+  // it that are the reference — a stale import's import and its use — are
+  // spans of their own, which together reach both ends of the label.
+  const referenceLines: Readonly<Record<string, readonly (readonly [number, number])[]>> = {
+    'rename-vs-callsite': [
+      [1, 1],
+      [4, 4],
+    ],
+    'signature-vs-caller': [[4, 4]],
+    'moved-export-vs-import': [
+      [1, 1],
+      [4, 4],
+    ],
+  };
 
   for (const fixture of SEMANTIC_CASES.filter((each) => each.twinOf === null)) {
     it(`attributes ${fixture.id} as its label says`, async () => {
@@ -158,8 +173,17 @@ describe("the evaluation suite's typecheck cases", () => {
       expect(spans(finding, pair.branchA)).toEqual([
         { path: label.spanA!.path, startLine: label.spanA!.start, endLine: label.spanA!.end },
       ]);
-      expect(spans(finding, pair.branchB)).toEqual([
-        { path: label.spanB!.path, startLine: label.spanB!.start, endLine: label.spanB!.end },
+      const onB = spans(finding, pair.branchB);
+      expect(onB).toEqual(
+        referenceLines[fixture.id]!.map(([startLine, endLine]) => ({
+          path: label.spanB!.path,
+          startLine,
+          endLine,
+        })),
+      );
+      expect([onB[0]!.startLine, onB.at(-1)!.endLine]).toEqual([
+        label.spanB!.start,
+        label.spanB!.end,
       ]);
       expect(
         trail(finding).map(({ branchRefId, symbol, action }) => ({ branchRefId, symbol, action })),
@@ -310,7 +334,8 @@ describe("each branch's own lines", () => {
       { path: 'src/payments.ts', startLine: 4, endLine: 4 },
     ]);
     expect(spans(finding, pair.branchB)).toEqual([
-      { path: 'src/support.ts', startLine: 1, endLine: 4 },
+      { path: 'src/support.ts', startLine: 1, endLine: 1 },
+      { path: 'src/support.ts', startLine: 4, endLine: 4 },
     ]);
   });
 });
@@ -336,7 +361,8 @@ describe('references', () => {
     const finding = only((await pair.attribute()).findings);
     expect(finding.rule).toBe(ATTRIBUTION_RULES.rename);
     expect(spans(finding, pair.branchB)).toEqual([
-      { path: 'src/support.ts', startLine: 1, endLine: 4 },
+      { path: 'src/support.ts', startLine: 1, endLine: 1 },
+      { path: 'src/support.ts', startLine: 4, endLine: 4 },
     ]);
     expect(trail(finding).map((step) => step.symbol)).toEqual(['processRefund', 'processRefund']);
   });
@@ -532,7 +558,8 @@ describe('references', () => {
     const finding = only((await pair.attribute()).findings);
     expect(finding.rule).toBe(ATTRIBUTION_RULES.rename);
     expect(spans(finding, pair.branchB)).toEqual([
-      { path: 'src/support.ts', startLine: 1, endLine: 6 },
+      { path: 'src/support.ts', startLine: 1, endLine: 3 },
+      { path: 'src/support.ts', startLine: 6, endLine: 6 },
     ]);
   });
 
@@ -545,7 +572,8 @@ describe('references', () => {
     const finding = only((await pair.attribute()).findings);
     expect(finding.rule).toBe(ATTRIBUTION_RULES.rename);
     expect(spans(finding, pair.branchB)).toEqual([
-      { path: 'src/my support.ts', startLine: 1, endLine: 4 },
+      { path: 'src/my support.ts', startLine: 1, endLine: 1 },
+      { path: 'src/my support.ts', startLine: 4, endLine: 4 },
     ]);
   });
 });
@@ -572,7 +600,8 @@ describe('when it cannot tell, it names no branch', () => {
     expectUnattributed(finding, 'both-changed-declaration');
     // What is known still stands: the reference is on the branch that holds it.
     expect(spans(finding, pair.branchB)).toEqual([
-      { path: 'src/support.ts', startLine: 1, endLine: 4 },
+      { path: 'src/support.ts', startLine: 1, endLine: 1 },
+      { path: 'src/support.ts', startLine: 4, endLine: 4 },
     ]);
   });
 
@@ -960,9 +989,13 @@ describe('evidence', () => {
         write(
           'src/support.ts',
           lines(
-            'import { processRefund } from "./payments";',
-            `// ${token}`,
+            // The import is the span, so what the excerpt is cut from is inside it.
+            'import {',
+            `  // ${token}`,
             ...noise,
+            '  processRefund,',
+            '} from "./payments";',
+            '',
             'export function escalate(orderId: string): string {',
             '  return processRefund(orderId);',
             '}',
@@ -1278,9 +1311,62 @@ describe('more of what a branch can hold', () => {
       ),
     );
     const finding = only((await pair.attribute()).findings);
-    // Through the shorthand on line 7; not the property and the member after it.
+    // Through the shorthand on line 7, adjacent uses one span; not the property
+    // and the member after it.
     expect(spans(finding, pair.branchB)).toEqual([
-      { path: 'src/support.ts', startLine: 1, endLine: 7 },
+      { path: 'src/support.ts', startLine: 1, endLine: 1 },
+      { path: 'src/support.ts', startLine: 4, endLine: 4 },
+      { path: 'src/support.ts', startLine: 6, endLine: 7 },
+    ]);
+  });
+
+  it("spans a line of uses once, and none on the import's own line", async () => {
+    const pair = await checkedPair(
+      rename.base,
+      rename.a,
+      committed(
+        write(
+          'src/support.ts',
+          lines(
+            'import { processRefund } from "./payments"; export const now = processRefund("n");',
+            'export const both = processRefund("a") + processRefund("b");',
+          ),
+        ),
+      ),
+    );
+    const finding = only((await pair.attribute()).findings);
+    expect(spans(finding, pair.branchB)).toEqual([
+      { path: 'src/support.ts', startLine: 1, endLine: 1 },
+      { path: 'src/support.ts', startLine: 2, endLine: 2 },
+    ]);
+  });
+
+  it('spans a use far from its import alone, and no more uses than the bound', async () => {
+    const filler = Array.from({ length: 300 }, (_, index) => `// ${String(index)}`);
+    const uses = Array.from({ length: MAX_SPANS_PER_SIDE + 2 }, (_, index) => [
+      '',
+      `export const r${String(index)} = processRefund('${String(index)}');`,
+    ]).flat();
+    const pair = await checkedPair(
+      rename.base,
+      rename.a,
+      committed(
+        write(
+          'src/support.ts',
+          lines('import { processRefund } from "./payments";', ...filler, ...uses),
+        ),
+      ),
+    );
+    const finding = only((await pair.attribute()).findings);
+    // The import, then the first uses in line order: each after a blank line,
+    // from line 303, and none of the filler between.
+    expect(spans(finding, pair.branchB)).toEqual([
+      { path: 'src/support.ts', startLine: 1, endLine: 1 },
+      ...Array.from({ length: MAX_SPANS_PER_SIDE - 1 }, (_, index) => ({
+        path: 'src/support.ts',
+        startLine: 303 + 2 * index,
+        endLine: 303 + 2 * index,
+      })),
     ]);
   });
 });

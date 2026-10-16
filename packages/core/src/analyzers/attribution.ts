@@ -23,6 +23,7 @@ import {
   looksBinary,
   MAX_ALIGN_EDITS,
   MAX_FINDINGS_PER_RUN,
+  MAX_SPANS_PER_SIDE,
 } from '../merge/conflict-classifier.js';
 import type { TreeEntry } from '../merge/conflict-classifier.js';
 import { alignLines } from '../merge/line-diff.js';
@@ -916,12 +917,13 @@ interface Found {
 }
 
 /**
- * Where a branch's half lies in its own tree: a span, and the trail step beside
- * it — none for a span widened because its line could not be placed, since a
- * step names a line.
+ * Where a branch's half lies in its own tree: its spans, and the trail step
+ * beside them — none for a span widened because its line could not be placed,
+ * since a step names a line.
  */
 interface Half {
-  readonly span: SpanEvidence;
+  /** The half's own place first, and at most {@link MAX_SPANS_PER_SIDE} in all. */
+  readonly spans: readonly SpanEvidence[];
   readonly step: SymbolTrailStep | null;
 }
 
@@ -1031,6 +1033,17 @@ function spanOf(branch: BranchRefId, source: Source, start: number, end: number)
     endLine: end,
     excerpt: excerptOf(source.lines.slice(start - 1, end)),
   };
+}
+
+/** Line numbers as runs of adjacent lines, each `[first, last]`, in line order. */
+function runsOf(lines: readonly number[]): [number, number][] {
+  const runs: [number, number][] = [];
+  for (const at of [...new Set(lines)].sort((x, y) => x - y)) {
+    const run = runs.at(-1);
+    if (run !== undefined && at === run[1] + 1) run[1] = at;
+    else runs.push([at, at]);
+  }
+  return runs;
 }
 
 /** Where lines were, on a branch that has none there now. */
@@ -1209,7 +1222,7 @@ class Attributor {
       return {
         adds: 'unsure',
         holds: false,
-        half: { span: spanOf(side.branch, source, start, end), step: null },
+        half: { spans: [spanOf(side.branch, source, start, end)], step: null },
       };
     }
     // An unaligned line is one this side does not have: the other side's
@@ -1225,9 +1238,12 @@ class Attributor {
   }
 
   /**
-   * The reference's half on one side: for a stale import, the import and every
-   * use of the name it binds, which are all stale with it; for an arity, the
-   * call; otherwise the line.
+   * The reference's half on one side: for a stale import, the import, then the
+   * lines that use the name it binds, which are all stale with it; for an
+   * arity, the call; otherwise the line.
+   *
+   * A use gets a span of its own rather than widening the import's: in a long
+   * file the lines between an import and its last use are not the reference.
    */
   #referenceHalf(branch: BranchRefId, source: Source, line: number, reference: Reference): Half {
     const t = this.#t;
@@ -1237,6 +1253,7 @@ class Attributor {
     let start = line;
     let end = line;
     let column: number | null = null;
+    const uses: number[] = [];
 
     if (reference.family === 'arity') {
       // The innermost call of that name holding the line: too many arguments
@@ -1268,12 +1285,18 @@ class Attributor {
           end = Math.max(end, lineOf(statement.getEnd()));
           column = file.getLineAndCharacterOfPosition(node.getStart(file)).character + 1;
         } else if (isUse(t, node)) {
-          end = Math.max(end, lineOf(node.getStart(file)));
+          uses.push(lineOf(node.getStart(file)));
         }
       }
     }
+    const used = runsOf(uses.filter((at) => at < start || at > end));
     return {
-      span: spanOf(branch, source, start, end),
+      spans: [
+        spanOf(branch, source, start, end),
+        ...used
+          .slice(0, MAX_SPANS_PER_SIDE - 1)
+          .map(([from, to]) => spanOf(branch, source, from, to)),
+      ],
       step: {
         branchRefId: branch,
         symbol: reference.name,
@@ -1468,7 +1491,7 @@ class Attributor {
     ): ChangeSeen => ({
       change,
       half: {
-        span: spanOf(side.branch, to, at.start, last),
+        spans: [spanOf(side.branch, to, at.start, last)],
         step: {
           branchRefId: side.branch,
           symbol: declared.name,
@@ -1480,7 +1503,7 @@ class Attributor {
     const removedAt = (path: string, at: number): ChangeSeen => ({
       change: 'removed',
       half: {
-        span: emptySpan(side.branch, path, at),
+        spans: [emptySpan(side.branch, path, at)],
         step: {
           branchRefId: side.branch,
           symbol: declared.name,
@@ -1583,7 +1606,7 @@ class Attributor {
     const attributed = decision.kind === 'attributed';
     const steps = halves.flatMap((half) => (half.step === null ? [] : [half.step]));
     const evidence: Evidence[] = [
-      ...halves.map((half) => half.span),
+      ...halves.flatMap((half) => half.spans),
       ...(steps.length > 0 ? [{ type: 'symbol-trail' as const, steps }] : []),
       output,
     ];

@@ -114,6 +114,12 @@ move, and empty where a removed one was — and the referencing branch's on the
 reference — the import and every use of the name it binds for a stale import,
 the call for an arity, and the line otherwise.
 
+A label marks a stale import from the import to its last use, but a span that
+long claims every line between, which in a long file is most of it. So the
+import is one span and each run of adjacent lines using the name is another,
+up to `MAX_SPANS_PER_SIDE` in all: together they reach both ends of the label,
+which the suite scores by overlap, without covering what lies between.
+
 ## What it reads, and what it must not
 
 Sources come from the shadow by tree id, through the textual classifier's blob

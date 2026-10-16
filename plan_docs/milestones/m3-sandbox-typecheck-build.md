@@ -333,7 +333,7 @@ _which branch caused which half_ of each one.
       **Constraints:** without this every finding is polluted by pre-existing noise, and the false-positive budget is blown on day one. Four compiler runs per pair is also four times the cost, so cache aggressively — A and B alone change only when their own snapshots change.
 
 - [x] **Attribution engine**
-      **Files:** `packages/core/src/analyzers/attribution.ts`, `attribution.test.ts`, `analyzers/index.ts`, `analyzers/notes.md`, `packages/core/src/merge/conflict-classifier.ts` (its blob reader, exported), `packages/shared/src/models/finding.ts` (the `confidence` comment), `packages/core/test/attribution.test.ts`, `packages/core/test/support/attribution-fixtures.ts`, `packages/core/test/user-repo-untouched.test.ts`, `packages/core/README.md`, `docs/architecture.md`, `docs/threat-model.md` (only if a printed field's contents change)
+      **Files:** `packages/core/src/analyzers/attribution.ts`, `attribution.test.ts`, `analyzers/index.ts`, `analyzers/notes.md`, `packages/core/src/merge/conflict-classifier.ts` (its blob reader, exported to core alone), `packages/core/src/merge/index.ts`, `packages/shared/src/models/finding.ts` (the `confidence` comment), `packages/core/test/attribution.test.ts`, `packages/core/test/support/attribution-fixtures.ts`, `packages/core/test/user-repo-untouched.test.ts`, `packages/core/README.md`, `docs/architecture.md`, `docs/threat-model.md` (only if a printed field's contents change)
       **What:** turn a diagnostic from the merged tree into a typecheck Finding about the two branches — which one changed the declaration the diagnostic names, which one holds the stale reference, a span on each in that branch's own lines, the rule the pair breaks, and the compiler's output as evidence. It takes any diagnostic as input and is independent of the baseline differ. Adding a typecheck analyzer to `ANALYZER_PIPELINE` is not this task.
 
   Rewritten before starting, from the issue. **The code gives the family; the
@@ -402,8 +402,11 @@ _which branch caused which half_ of each one.
   side's span is the renamed declaration from its start to its name, the
   changed one to the close of its parameters, or the moved one whole in its new
   file, and an empty span where a removed one was. The referencing side's is
-  the import and every use of its binding for a stale import, the call for an
-  arity, and the reference's line otherwise.
+  the call for an arity and the reference's line otherwise; for a stale import,
+  the import, and each run of lines that use its binding as a span of its own,
+  up to `MAX_SPANS_PER_SIDE` in all — never one span from the import to its
+  last use, which in a long file is hundreds of lines that are not the
+  reference.
 
   **`originBranch` is the declaring branch, or null.** It is chosen once for
   every rule: `Attribution.originBranch` is "the side that introduced the
@@ -417,7 +420,7 @@ _which branch caused which half_ of each one.
   the first that applies is the rationale. Severity is `high` either way: the
   merged tree does not compile.
 
-  **Evidence:** a span on each branch that has a half, declaring side first,
+  **Evidence:** spans on each branch that has a half, declaring side first,
   each with a short redacted excerpt (`excerptOf`); a symbol trail — the
   declaring branch's step (`renamed`, `moved`, `signature-changed` or
   `deleted`, at the declaration in its own tree) then the referencing branch's
@@ -429,14 +432,15 @@ _which branch caused which half_ of each one.
   - _rename:_ branch A renames `processRefund` to `refundPayment` and updates
     its own callers; branch B adds `src/support.ts`, uncommitted, calling
     `processRefund`. The Finding is `rename-vs-callsite`, origin A, with a span
-    on A over `src/payments.ts` line 1, on B over `src/support.ts` lines 1–4,
-    and a trail of A renaming `processRefund` and B referencing it;
+    on A over `src/payments.ts` line 1, on B over `src/support.ts` lines 1
+    and 4 — the import and the call, the two ends of the label's 1–4 — and a
+    trail of A renaming `processRefund` and B referencing it;
   - _signature:_ A adds a required parameter to `formatPrice`; B adds a call
     without it. `signature-vs-caller`, A's span on `src/format.ts` line 1, B's
     on `src/invoice.ts` line 4;
   - _moved export:_ A moves `slugify` from `src/utils.ts` to `src/strings.ts`;
     B adds `src/tag.ts`, importing it from `./utils`. `moved-export-vs-import`,
-    A's span on `src/strings.ts` lines 1–3, B's on `src/tag.ts` lines 1–4;
+    A's span on `src/strings.ts` lines 1–3, B's on `src/tag.ts` lines 1 and 4;
   - each runs on the diagnostic the type-check service reports for the merged
     slot, and the three are the cases in `eval/fixtures/semantic.ts`, mirrored
     in `packages/core/test/` and held equal to it by a test that reads it; each
@@ -498,6 +502,36 @@ _which branch caused which half_ of each one.
   here: grouping several diagnostics about one declaration into one Finding,
   and reconciliation keys for typecheck Findings — both the typecheck
   analyzer's, which decides what a Finding's identity is.
+
+- [ ] **Typecheck analyzer**
+      **Files:** `packages/core/src/analyzers/` (the analyzer, its reconciliation key, `ANALYZER_PIPELINE`), `packages/daemon/src/` (the registry, reconciliation, dismissal)
+      **What:** join the three steps above into an analyzer in `ANALYZER_PIPELINE`: type-check the merged slot, keep what the baseline differ says the merge introduced, and attribute that. The daemon constructs the type-check registry, lets a slot's service go through the pool's `onEvict`, and closes it on stop. Gathered here from the tasks above, which each left one of these to it.
+
+  **Done when:**
+  - attribution is given the baseline differ's output and nothing else: a
+    repository whose default branch already has type errors produces no
+    typecheck Finding for a merge that introduces none. Attribution makes a
+    Finding of every diagnostic it is given — at 0.5 where it cannot attribute
+    one — so the raw report would turn each error on `main` into one;
+  - a typecheck Finding has a reconciliation key and content, as a textual one
+    has `textualFindingKey` and `textualFindingContent`: the same conflict on
+    the next run takes over the open Finding's id and `firstSeenAt` rather than
+    opening a duplicate, it resolves when it stops reproducing, and a dismissed
+    one stays dismissed while the content it was judged at stands. Each Finding
+    gets a fresh id today, and reconciliation and dismissal match textual
+    Findings only;
+  - whether several diagnostics about one declaration are one Finding is
+    decided, since it is part of what the key identifies;
+  - the toolchain fingerprint names the TypeScript version, and `typecheck.*`
+    config is read, with the CHANGELOG entry the typecheck runner left to this
+    change;
+  - the compiler's one-time load (~360 ms) happens at daemon start or in the
+    type-check worker, not on the daemon's thread in the first attribution.
+
+  **Constraints:** the key is built as the textual one is — the pair
+  unordered, the rule, and what the conflict is about — never from a span's
+  lines, which move whenever either branch edits above them, or from the
+  commits.
 
 - [ ] **Build analyzer**
       **Files:** `packages/core/src/analyzers/build.ts`

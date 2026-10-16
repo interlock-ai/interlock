@@ -4,6 +4,12 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-10-16 — attribution engine, from the review of #98
+
+- **Review — four points.** Attribution's input is documented as the baseline differ's output, since every diagnostic given becomes a Finding; `merge/index.ts` lists the classifier's exports, so the blob reader, `TreeEntry`, `looksBinary` and `MAX_ALIGN_EDITS` stay core's own and its surface is what it was before; a stale import's span no longer runs from the import to its last use; and reconciliation keys have a task of their own.
+- **Task rewritten — a stale import is the import and its uses as spans of their own,** up to `MAX_SPANS_PER_SIDE`, never one span over every line between. The eval labels mark 1–4, the import to the call; the spans are 1 and 4, which reach both ends and score the same, since the suite matches by overlap. The Done when's "lines 1–4" now reads "lines 1 and 4".
+- **Task added — Typecheck analyzer.** The tasks above each left it one thing — attribution fed only the differ's output, a reconciliation key and content so a typecheck Finding is matched across runs and dismissals hold, grouping, the TypeScript version in the fingerprint, `typecheck.*` read with its CHANGELOG entry, the compiler's one-time load — and none had a task that owned them.
+
 ## 2026-10-16 — typecheck runner, reworked from the review of #97
 
 - **Reworked from review.** #97 was a parallel version of this task on an older base; the review kept nine of its parts for `dev`'s service (#91) and trimmed the rest. Ported onto #91's design, not rebased: the tree's listing, the outcome kinds, the deadline and its grace, the install identity, an empty worker environment and a configured heap, the walk past a workspace link, the bench script and its numbers, and the importer-cancellation test. Already on `dev` and kept as they were: plugin stripping and its `extends` test, the `tsc`-parity tests, the heap check after each check. Task rewritten in the same change, and ticked: every `Done when` passes, archestra's numbers included.

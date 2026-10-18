@@ -332,11 +332,206 @@ _which branch caused which half_ of each one.
       **Done when:** a repository whose `main` already has type errors produces zero findings for a merge that introduces none, and a genuinely merge-induced error is still reported.
       **Constraints:** without this every finding is polluted by pre-existing noise, and the false-positive budget is blown on day one. Four compiler runs per pair is also four times the cost, so cache aggressively — A and B alone change only when their own snapshots change.
 
-- [ ] **Attribution engine**
-      **Files:** `packages/core/src/analyzers/`
-      **What:** turn a new diagnostic into a statement about two branches. Intersect the error's location and the symbol it names against each branch's ChangeSet to decide which side removed or renamed the thing and which side referenced it.
-      **Done when:** the M3 demo case produces "branch A renamed `processRefund`; branch B added a call to the old name" with both spans, rather than a compiler message with a line number.
-      **Constraints:** this is the difference between a useful warning and a compiler dump, and it is the hardest engineering in the milestone. When attribution is ambiguous, report the finding with lower confidence rather than guessing a branch — a wrong accusation costs more agent trust than a vague one. **Rule names and span attribution follow the labels in `eval/fixtures/semantic.ts`,** which were written first and are read-only: the rules are `rename-vs-callsite`, `signature-vs-caller` and `moved-export-vs-import` — never a compiler code such as `TS2554` — and the spans put the branch that changed a declaration on that declaration, and the branch holding the stale reference on the reference. An analyzer that names its findings otherwise scores recall 0 against a set nobody can edit, and looks broken when it is not.
+- [x] **Attribution engine**
+      **Files:** `packages/core/src/analyzers/attribution.ts`, `attribution.test.ts`, `analyzers/index.ts`, `analyzers/notes.md`, `packages/core/src/merge/conflict-classifier.ts` (its blob reader, exported to core alone), `packages/core/src/merge/index.ts`, `packages/shared/src/models/finding.ts` (the `confidence` comment), `packages/core/test/attribution.test.ts`, `packages/core/test/support/attribution-fixtures.ts`, `packages/core/test/user-repo-untouched.test.ts`, `packages/core/README.md`, `docs/architecture.md`, `docs/threat-model.md` (only if a printed field's contents change)
+      **What:** turn a diagnostic from the merged tree into a typecheck Finding about the two branches — which one changed the declaration the diagnostic names, which one holds the stale reference, a span on each in that branch's own lines, the rule the pair breaks, and the compiler's output as evidence. It takes any diagnostic as input and is independent of the baseline differ. Adding a typecheck analyzer to `ANALYZER_PIPELINE` is not this task.
+
+  Rewritten before starting, from the issue. **The code gives the family; the
+  declaring branch's change gives the rule.** Measured on TypeScript 6.0.3, the
+  rename and the moved-export fixtures both reach the compiler as an import of a
+  name the module no longer exports — TS2305 at the import specifier, in both —
+  so a table from code to rule would label the rename a move. Two families are
+  recognised. _A name that no longer resolves_: 2304 and 2552 (cannot find a
+  name, and its "did you mean" twin), 2339 and 2551 (a property, and its twin),
+  2305, 2614 and 2724 (a module's missing export). _An arity that no longer
+  fits_: 2554 and 2555. Every other code is attributed to no branch. The rule
+  comes from what the declaring branch did: renamed is `rename-vs-callsite`,
+  moved is `moved-export-vs-import`, a changed parameter list is
+  `signature-vs-caller`.
+
+  **The name comes from the merged tree, never from the message,** whose
+  wording changes between TypeScript versions. The merged file is read from the
+  shadow by tree id and parsed with Interlock's own TypeScript —
+  `ts.createSourceFile`, no program — and the diagnostic's offset must land on
+  the line and column it reports, on an identifier for a name, or inside a call
+  whose callee is a name or a property access for an arity. Anything else —
+  the file not in the tree, over the parse cap, binary, unparseable, or an
+  offset that does not hold a name — is attributed to no branch. Parsing is on
+  the daemon's thread, so a file over 256 KiB is not parsed and each parse is
+  a turn of its own; the longest stall is measured and recorded.
+
+  **The declaration is found in the pair's merge base:** for an imported name,
+  in the module a relative specifier resolves to (`.ts`, `.tsx`, `.d.ts`,
+  `.mts`, `.cts`, `.js` read as `.ts`, `/index.ts`), as an exported declaration
+  or an export specifier, an alias followed to the name it imports; for a name
+  that does not resolve, at the top level of the reference's own file; for a
+  property, as the one class or interface member of that name in the files
+  either ChangeSet touches. A bare specifier, a global, or more than one
+  candidate is attributed to no branch.
+
+  **The declaring branch** is the one whose ChangeSet touches the declaration —
+  a hunk's old range crosses it, an insertion lands strictly inside it, or the
+  file was deleted or renamed — and exactly one must. Its own tree must then
+  show a change the family explains: _moved_, the name exported from exactly
+  one other file that branch added or modified; _renamed_, a declaration of the
+  same kind under another name where the base declaration maps to, the old name
+  gone from the file; _removed_, the name gone; _signature changed_, for an
+  arity, the minimum, maximum or rest of its parameters differs from the base's,
+  overloads included. A removal names its branch under the generic rule.
+
+  **The referencing branch** is the one whose ChangeSet adds the line holding
+  the diagnostic, mapped into that branch's own file. Exactly one must, and it
+  must not be the declaring branch.
+
+  **A ChangeSet is read in its own coordinates and checked against the
+  shadow.** It is diffed against the merge base with the default branch, which
+  need not be the pair's: its hunks are compared with the declaration as its own
+  base holds it. A side captured again keeps the ChangeSet it had, against a new
+  tree, so for every path a decision reads, the blobs at the ChangeSet's base
+  and at the merged commit must agree with what it claims; one that does not is
+  stale, and stale is treated as missing.
+
+  **Lines are each branch's own.** The diagnostic's line is the merged tree's;
+  a file the other branch also changed has different lines on this one. The
+  merged file is aligned to the branch's file (`alignLines`, bounded): an
+  identical blob maps line for line, an aligned line maps exactly, and an
+  unaligned one maps to the gap between its nearest aligned neighbours. A span
+  whose mapping is unsure stays in its file and widens to that gap — or, with
+  nothing aligned, to the branch's hunks in the file — rather than point at a
+  wrong line; the branch it would name is then not decided by it. The declaring
+  side's span is the renamed declaration from its start to its name, the
+  changed one to the close of its parameters, or the moved one whole in its new
+  file, and an empty span where a removed one was. The referencing side's is
+  the call for an arity and the reference's line otherwise; for a stale import,
+  the import, and each run of lines that use its binding as a span of its own,
+  up to `MAX_SPANS_PER_SIDE` in all — never one span from the import to its
+  last use, which in a long file is hundreds of lines that are not the
+  reference.
+
+  **`originBranch` is the declaring branch, or null.** It is chosen once for
+  every rule: `Attribution.originBranch` is "the side that introduced the
+  change that broke the other", and both halves are needed for these
+  conflicts. Attributed, a Finding has confidence 1 and the rule its change
+  names. Anything else is `merge-breaks-typecheck` — named as the eval suite
+  names `merge-breaks-test` — with `originBranch` null, confidence 0.5, and a
+  rationale saying what could not be told. Reasons are checked in a fixed
+  order — code, location, a missing ChangeSet, declaration, a stale ChangeSet,
+  reference in the base, declaring branch, mapping, referencing branch — and
+  the first that applies is the rationale. Severity is `high` either way: the
+  merged tree does not compile.
+
+  **Evidence:** spans on each branch that has a half, declaring side first,
+  each with a short redacted excerpt (`excerptOf`); a symbol trail — the
+  declaring branch's step (`renamed`, `moved`, `signature-changed` or
+  `deleted`, at the declaration in its own tree) then the referencing branch's
+  (`referenced`); and the compiler's diagnostic as process output, in `tsc`'s
+  own form, with `tsc`'s exit status for a project with errors (2), redacted.
+  An unattributed Finding keeps whatever of these is known.
+
+  **Done when:**
+  - _rename:_ branch A renames `processRefund` to `refundPayment` and updates
+    its own callers; branch B adds `src/support.ts`, uncommitted, calling
+    `processRefund`. The Finding is `rename-vs-callsite`, origin A, with a span
+    on A over `src/payments.ts` line 1, on B over `src/support.ts` lines 1
+    and 4 — the import and the call, the two ends of the label's 1–4 — and a
+    trail of A renaming `processRefund` and B referencing it;
+  - _signature:_ A adds a required parameter to `formatPrice`; B adds a call
+    without it. `signature-vs-caller`, A's span on `src/format.ts` line 1, B's
+    on `src/invoice.ts` line 4;
+  - _moved export:_ A moves `slugify` from `src/utils.ts` to `src/strings.ts`;
+    B adds `src/tag.ts`, importing it from `./utils`. `moved-export-vs-import`,
+    A's span on `src/strings.ts` lines 1–3, B's on `src/tag.ts` lines 1 and 4;
+  - each runs on the diagnostic the type-check service reports for the merged
+    slot, and the three are the cases in `eval/fixtures/semantic.ts`, mirrored
+    in `packages/core/test/` and held equal to it by a test that reads it; each
+    twin reports no diagnostic, so attribution is never asked;
+  - a reference in a file both branches edited gets a span in the referencing
+    branch's own lines, where they differ from the merged file's; a
+    declaration in a file the declaring branch renamed gets the reference's
+    span under the referencing branch's own path;
+  - both branches changing the declaration, a reference already in the base, a
+    code it does not recognise and a missing ChangeSet each produce a Finding
+    with confidence 0.5, `originBranch` null and the rationale for that case —
+    and so does a stale ChangeSet, a non-relative import, and a file it cannot
+    read;
+  - an excerpt holding terminal control characters and a secret is redacted and
+    kept to the excerpt bounds;
+  - no Finding's title, description or rationale holds a name or path from the
+    repository, for any rule or reason;
+  - importing `@interlock/core` still does not load `typescript`;
+  - the user repository is untouched by an attribution, in
+    `user-repo-untouched.test.ts`.
+
+  **Edge cases and the tests they need:**
+  - Hunks with `--unified=0`: an insertion's `oldStart` is the line it follows;
+    a deletion's `newStart` the line it follows; an added file is `-0,0`. One
+    test per boundary — an insertion before, inside and after the declaration.
+  - A ChangeSet whose base is not the pair's merge base, and one computed for an
+    earlier tree: each its own test.
+  - An imported name under an alias, and a namespace import's property.
+  - More diagnostics than `MAX_FINDINGS_PER_RUN`: the rest are counted, not
+    read. An aborted signal stops the batch with `REQUEST_CANCELLED`.
+  - A file nested deeply enough to overflow the parser's stack is unreadable,
+    not a crash.
+  - A path holding a space.
+
+  **Failure modes:** a branch named on a guess — every reason has a test
+  asserting `originBranch` null; a span on a line that exists on no branch — the
+  mapping widens rather than guesses, with a test; a rule that is a compiler
+  code — rule names are asserted never to be one; repository content in a
+  field the CLI prints unwrapped — asserted absent; `typescript` loaded by
+  importing `core` — asserted not; a git failure turned into a Finding — the
+  runner's infrastructure error propagates, as the textual classifier's does.
+
+  **Constraints:** hard rule 2 — nothing executes repository code: sources are
+  read from the shadow by tree id and parsed, never loaded. No new dependency in
+  `core`: the compiler is the `typescript` ADR-0008 already added, loaded on
+  first use. Models are wire formats: the existing `Finding`, `Attribution`,
+  `SpanEvidence`, `SymbolTrailEvidence` and process-output evidence, unchanged.
+  Names, paths and excerpts are repository content, and the threat model's
+  "What the CLI prints" table says a title holds none: names stay in the symbol
+  trail, the spans and the process output, which the CLI does not print, and
+  titles, descriptions and rationales are fixed text. **Rule names and span
+  attribution follow the labels in `eval/fixtures/semantic.ts`,** which were
+  written first and are read-only: the rules are `rename-vs-callsite`,
+  `signature-vs-caller` and `moved-export-vs-import` — never a compiler code
+  such as `TS2554` — and the spans put the branch that changed a declaration on
+  that declaration, and the branch holding the stale reference on the
+  reference. An analyzer that names its findings otherwise scores recall 0
+  against a set nobody can edit, and looks broken when it is not. Not built
+  here: grouping several diagnostics about one declaration into one Finding,
+  and reconciliation keys for typecheck Findings — both the typecheck
+  analyzer's, which decides what a Finding's identity is.
+
+- [ ] **Typecheck analyzer**
+      **Files:** `packages/core/src/analyzers/` (the analyzer, its reconciliation key, `ANALYZER_PIPELINE`), `packages/daemon/src/` (the registry, reconciliation, dismissal)
+      **What:** join the three steps above into an analyzer in `ANALYZER_PIPELINE`: type-check the merged slot, keep what the baseline differ says the merge introduced, and attribute that. The daemon constructs the type-check registry, lets a slot's service go through the pool's `onEvict`, and closes it on stop. Gathered here from the tasks above, which each left one of these to it.
+
+  **Done when:**
+  - attribution is given the baseline differ's output and nothing else: a
+    repository whose default branch already has type errors produces no
+    typecheck Finding for a merge that introduces none. Attribution makes a
+    Finding of every diagnostic it is given — at 0.5 where it cannot attribute
+    one — so the raw report would turn each error on `main` into one;
+  - a typecheck Finding has a reconciliation key and content, as a textual one
+    has `textualFindingKey` and `textualFindingContent`: the same conflict on
+    the next run takes over the open Finding's id and `firstSeenAt` rather than
+    opening a duplicate, it resolves when it stops reproducing, and a dismissed
+    one stays dismissed while the content it was judged at stands. Each Finding
+    gets a fresh id today, and reconciliation and dismissal match textual
+    Findings only;
+  - whether several diagnostics about one declaration are one Finding is
+    decided, since it is part of what the key identifies;
+  - the toolchain fingerprint names the TypeScript version, and `typecheck.*`
+    config is read, with the CHANGELOG entry the typecheck runner left to this
+    change;
+  - the compiler's one-time load (~360 ms) happens at daemon start or in the
+    type-check worker, not on the daemon's thread in the first attribution.
+
+  **Constraints:** the key is built as the textual one is — the pair
+  unordered, the rule, and what the conflict is about — never from a span's
+  lines, which move whenever either branch edits above them, or from the
+  commits.
 
 - [ ] **Build analyzer**
       **Files:** `packages/core/src/analyzers/build.ts`

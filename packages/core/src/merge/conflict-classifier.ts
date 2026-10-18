@@ -138,7 +138,7 @@ export const MAX_BLOB_BYTES = 1024 * 1024;
  * clean changes — usually a few lines, and when it is not, silence is cheaper
  * than a guess.
  */
-const MAX_ALIGN_EDITS = 1000;
+export const MAX_ALIGN_EDITS = 1000;
 
 const TYPE_MODIFY_DELETE = 'CONFLICT (modify/delete)';
 const TYPE_RENAME_DELETE = 'CONFLICT (rename/delete)';
@@ -640,7 +640,7 @@ function isText(side: MergeConflictSide | null): side is MergeConflictSide {
  * modify/delete or rename/delete says nothing either way, and a span over a
  * binary file's "lines" would be invented.
  */
-function looksBinary(text: string): boolean {
+export function looksBinary(text: string): boolean {
   return text.slice(0, BINARY_SNIFF_LENGTH).includes('\0');
 }
 
@@ -877,15 +877,22 @@ function toFinding(
 
 // --- Reading the shadow -----------------------------------------------------------
 
-interface TreeEntry {
+/** One blob of a tree listing. */
+export interface TreeEntry {
   readonly mode: string;
   readonly oid: string;
   /** Bytes; null for anything but a blob. */
   readonly size: number | null;
 }
 
-/** Blob and tree reads for one classification, each object read at most once. */
-class BlobReader {
+/**
+ * Blob and tree reads through the shadow for one pass over a merge, each
+ * object read at most once.
+ *
+ * Reads only: every call is `ls-tree` or `cat-file`, and a failing one throws
+ * the runner's `InterlockError` rather than answering nothing.
+ */
+export class BlobReader {
   readonly #shadow: ShadowRepo;
   readonly #runner: GitRunner;
   readonly #texts = new Map<string, string | null>();

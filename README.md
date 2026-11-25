@@ -2,8 +2,6 @@
 
 **Early conflict detection and integration intelligence for parallel AI coding agents.**
 
-> Status: scaffold. Structure, contracts and docs are in place; implementations are landing.
-
 ## The problem
 
 Developers now run several AI coding agents at once, each in its own worktree or branch. Those parallel streams collide, and the collisions are discovered at merge time — after hours of agent work have already been spent. Around 28% of AI-agent PRs hit merge conflicts.
@@ -32,23 +30,34 @@ Enforced by types and tests, not promises:
 
 ## Quickstart
 
-> Not runnable yet — the scaffold has no implementations.
-
 ```bash
 git clone https://github.com/interlock-ai/interlock.git && cd interlock
 ./scripts/setup.sh          # checks prerequisites, installs, verifies
-pnpm verify                 # build + lint + format + typecheck + test
+pnpm build
+alias interlock="node $PWD/packages/cli/dist/main.js"
 ```
 
-Planned usage:
+Tell the daemon which repositories to watch, then run it in the background:
 
 ```bash
-interlock init              # set up a repo, install agent hooks
-interlock daemon start      # background service
-interlock status            # in-flight branches and open findings
-interlock check A B         # force-check a pair now
-open http://127.0.0.1:47317 # dashboard
+mkdir -p -m 700 ~/.interlock
+echo '{ "repos": ["/path/to/your/repo"] }' > ~/.interlock/config.json
+
+interlock daemon start           # detached; logs to ~/.interlock/daemon.log
+interlock status                 # in-flight branches, dirty state, agent sessions
+interlock check feature-a feature-b   # merge a pair now and print what conflicts
+interlock daemon logs --follow   # what the daemon is doing
+interlock daemon autostart on    # start it at login (launchd or systemd)
 ```
+
+Turning it off:
+
+```bash
+interlock daemon stop            # stop it
+interlock daemon stop --purge    # stop it, remove autostart, delete everything Interlock stored
+```
+
+`INTERLOCK_DATA_DIR` points every command and the daemon at another data directory.
 
 ## Repository layout
 
@@ -90,11 +99,6 @@ Every speculative merge runs `git merge-tree` against a given base, with the
 repository's attributes read from a commit rather than a checkout — flags from
 git 2.40 and 2.41. macOS ships 2.39 at `/usr/bin/git`; install a newer one —
 Homebrew's, for instance — and put it first on `PATH`.
-
-On Linux, not Node 26.9.0. Its recursive directory watcher throws `EACCES` from
-inside Node's own event callback when a watched directory becomes unreadable —
-an unmounted volume, a permission change — and nothing outside Node can catch
-it, so the daemon stops. Node 26.8 and earlier are unaffected, as is macOS.
 
 ## License
 

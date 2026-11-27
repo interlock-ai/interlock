@@ -4,6 +4,15 @@ Short entries: done, decided, blocked. Newest first.
 
 ---
 
+## 2026-11-24 — infra failure handling
+
+- **Task rewritten before starting.** "Infra failure handling" expanded in M3 to M1's depth from issue #113: slot requirements on analyzers, error boundary for thrown infra errors, timeout retry semantics without `analysedAt`, and user-visible status reporting.
+- **Decided:** thrown `InterlockError { infra: true }` from `analyze()` → `infraFailure(redact(message))` in pipeline; non-infra throws re-raised loud.
+- **Decided:** `timeout` verdict treated same as `infra-failure` by pipeline — both → run `failed`, pair not added to `analysedAt`, scheduler backs off and retries.
+- **Decided:** `needsSlot` on `Analyzer` interface; pipeline checks before `analyze()` and after (guards buggy clean return).
+- `pnpm verify:static` green; 7 new run-pipeline tests added covering all failure paths; CI on Linux needed for full `pnpm test`.
+- **Closed:** M3 "Infra failure handling" task ticked.
+
 ## 2026-11-13 — the 24 cell held at 24.21.0
 
 - **Found — the regression is wider than 26.9.0.** nodejs/node#66791 reports the recursive watcher's `EACCES` on 24.22.0 and 26.12.0 as well; 24.21.0 and 26.8.2 survive. The floating 24 cell took 24.22.0, so `status.test.ts`'s unreadable-worktree test ended the run with an unhandled error on `dev` and on every branch cut from it. The 26 cells read `.node-version` (26.4.0) and were never exposed.

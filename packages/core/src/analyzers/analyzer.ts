@@ -1,9 +1,11 @@
+import { redact } from '@interlock/shared';
 import type {
   AnalyzerKind,
   AnalyzerVerdict,
   BranchRefId,
   ChangeSet,
   Finding,
+  InterlockError,
   Logger,
   SpeculativeRunId,
 } from '@interlock/shared';
@@ -38,6 +40,18 @@ export interface Analyzer {
    * pair already judged, until the version it is keyed under changes.
    */
   readonly version: number;
+
+  /**
+   * Whether this analyzer reads the merged tree from disk, in the pair's pool
+   * slot (`context.slot`).
+   *
+   * Required, so no analyzer can be written without deciding: the slot is
+   * null for a clean merge whose dependencies differ from the installed tree,
+   * and an analyzer that needs it cannot run then. The pipeline answers that
+   * case `infra-failure` without calling `analyze`, rather than trust whatever
+   * an analyzer handed a null slot would say — `clean`, most likely.
+   */
+  readonly needsSlot: boolean;
 
   /**
    * Cheap pre-check: can this analyzer produce anything useful for this run?
@@ -87,4 +101,17 @@ export const CLEAN: AnalyzerOutcome = { verdict: 'clean', findings: [] };
 
 export function infraFailure(diagnostic: string): AnalyzerOutcome {
   return { verdict: 'infra-failure', findings: [], diagnostic };
+}
+
+/**
+ * An infrastructure error as an analyzer's non-verdict: its code, its message
+ * and its remedy, redacted.
+ *
+ * The remedy is what a person acts on — start Docker, pull the image — and the
+ * code is what a script matches on, so both travel to where the failure is
+ * shown. Details stay out: they carry paths, and nothing here needs them.
+ */
+export function infraFailureFrom(error: InterlockError): AnalyzerOutcome {
+  const remedy = error.remedy === undefined ? '' : ` (${error.remedy})`;
+  return infraFailure(redact(`${error.code}: ${error.message}${remedy}`));
 }
